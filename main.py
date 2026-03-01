@@ -1,106 +1,147 @@
 import os
 import re
-from datetime import datetime
-from zoneinfo import ZoneInfo
+import threading
+from typing import Dict, Set, Optional
 
 import requests
 from fastapi import FastAPI, Request
 
+# Optional scheduler (failsafe flatten)
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
+
 app = FastAPI()
 
+# ====== ENV VARS ======
 TRADERSPOST_WEBHOOK = os.getenv("TRADERSPOST_WEBHOOK", "").strip()
-TZ_NAME = os.getenv("TZ_NAME", "America/Denver")
-MAX_BUYS_PER_DAY = int(os.getenv("MAX_BUYS_PER_DAY", "5"))
 
-TZ = ZoneInfo(TZ_NAME)
+# Max number of OPEN positions allowed at any moment
+MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "5"))
 
-# In-memory daily state (resets if Railway restarts)
-_state = {
-    "date": None,           # YYYY-MM-DD in TZ
-    "buy_count": 0,         # number of BUYs sent today
-    "bought_symbols": set() # symbols already bought today (to prevent duplicates)
-}
+# Failsafe flatten: 1:55pm Utah time (America/Denver)
+ENABLE_FLATTEN_FAILSAFE = os.getenv("ENABLE_FLATTEN_FAILSAFE", "true").lower() in ("1", "true", "yes", "y")
+FLATTEN_TZ = os.getenv("FLATTEN_TZ", "America/Denver")
+FLATTEN_HOUR = int(os.getenv("FLATTEN_HOUR", "13"))     # 13 = 1pm
+FLATTEN_MINUTE = int(os.getenv("FLATTEN_MINUTE", "55")) # 55
 
+# ====== STATE ======
+# Track symbols currently "open" according to our webhook logic
+_open_positions: Set[str] = set()
+_lock = threading.Lock()
 
-def _today_str() -> str:
-    return datetime.now(TZ).date().isoformat()
+# ====== HELPERS ======
+SYMBOL_RE = re.compile(r"Symbol\s+([A-Z]{1,10})\b")
 
+def _extract_text(update: dict) -> str:
+    """
+    Telegram updates may store content in:
+      - message.text (normal)
+      - message.caption (forwarded media / link previews)
+      - edited_message.text/caption
+    """
+    msg = update.get("message") or update.get("edited_message") or {}
+    return (msg.get("text") or msg.get("caption") or "").strip()
 
-def _reset_if_new_day() -> None:
-    today = _today_str()
-    if _state["date"] != today:
-        _state["date"] = today
-        _state["buy_count"] = 0
-        _state["bought_symbols"] = set()
-        print(f"[DAILY RESET] New day in {TZ_NAME}: {today}. Counters cleared.")
+def _parse_symbol(text: str) -> Optional[str]:
+    m = SYMBOL_RE.search(text)
+    if not m:
+        return None
+    return m.group(1).upper()
 
-
-def _post_to_traderspost(symbol: str, action: str) -> str:
+def _send_to_traderspost(symbol: str, action: str) -> None:
+    """
+    action: 'buy' or 'sell'
+    NOTE: In TradersPost, configure the strategy so a SELL signal closes the position (not short).
+    """
     if not TRADERSPOST_WEBHOOK:
-        raise RuntimeError("TRADERSPOST_WEBHOOK env var is not set")
+        print("[ERROR] TRADERSPOST_WEBHOOK not set")
+        return
 
-    payload = {"ticker": symbol, "action": action}
-    r = requests.post(TRADERSPOST_WEBHOOK, json=payload, timeout=15)
-    return f"{r.status_code} {r.text}"
+    payload = {
+        "ticker": symbol,
+        "action": action.lower(),
+    }
 
+    try:
+        r = requests.post(TRADERSPOST_WEBHOOK, json=payload, timeout=15)
+        print(f"[TP] Sent {action.upper()} {symbol} -> {r.status_code} {r.text}")
+    except Exception as e:
+        print(f"[TP][ERROR] Failed sending {action.upper()} {symbol}: {e}")
 
+def _flatten_all() -> None:
+    """
+    Failsafe: sell everything we *think* is open, then clear the set.
+    """
+    with _lock:
+        to_close = sorted(_open_positions)
+
+    if not to_close:
+        print("[FLATTEN] No open positions to close.")
+        return
+
+    print(f"[FLATTEN] Closing {len(to_close)} positions: {to_close}")
+    for sym in to_close:
+        _send_to_traderspost(sym, "sell")
+
+    with _lock:
+        _open_positions.clear()
+
+# ====== TELEGRAM WEBHOOK ======
 @app.post("/telegram/webhook")
 async def telegram_webhook(request: Request):
-    _reset_if_new_day()
+    update = await request.json()
+    text = _extract_text(update)
 
-    data = await request.json()
+    print("[RX] Raw text/caption:", text)
 
-    msg = data.get("message", {}) or {}
-    text = msg.get("text") or msg.get("caption") or ""
-    print(f"Received text/caption: {text[:200]}")
+    symbol = _parse_symbol(text)
+    if not symbol:
+        return {"status": "no_symbol_found"}
 
-    # Your Intellectia format: "Symbol CIEN has a daytrading signal!"
-    m = re.search(r"Symbol\s+([A-Z]{1,10})\b", text, re.IGNORECASE)
-    if not m:
-        return {"status": "ignored", "reason": "no Symbol <TICKER> found"}
+    # Toggle logic:
+    # - If symbol is already open -> SELL (close)
+    # - Else -> BUY, but only if we have capacity under MAX_OPEN_POSITIONS
+    with _lock:
+        is_open = symbol in _open_positions
+        open_count = len(_open_positions)
 
-    symbol = m.group(1).upper()
+        if is_open:
+            # Close it
+            _open_positions.remove(symbol)
+            action = "sell"
+            reason = "toggle_close"
+        else:
+            # Open it only if capacity allows
+            if open_count >= MAX_OPEN_POSITIONS:
+                print(f"[LIMIT] Max open positions reached ({open_count}/{MAX_OPEN_POSITIONS}). Ignoring BUY for {symbol}.")
+                return {"status": "blocked_max_open_positions", "symbol": symbol, "open_positions": open_count}
 
-    # If you later add SELL support, you can detect it here.
-    # For now, treat all signals as BUY (current behavior).
-    action = "buy"
+            _open_positions.add(symbol)
+            action = "buy"
+            reason = "toggle_open"
 
-    # Enforce max buys per day
-    if action == "buy":
-        if symbol in _state["bought_symbols"]:
-            print(f"[SKIP] Duplicate BUY for {symbol} on {_state['date']}.")
-            return {"status": "skipped", "reason": "duplicate buy today", "symbol": symbol}
-
-        if _state["buy_count"] >= MAX_BUYS_PER_DAY:
-            print(f"[SKIP] Daily BUY limit reached ({MAX_BUYS_PER_DAY}). Ignoring {symbol}.")
-            return {
-                "status": "skipped",
-                "reason": "daily buy limit reached",
-                "symbol": symbol,
-                "buy_count": _state["buy_count"],
-                "max_buys_per_day": MAX_BUYS_PER_DAY,
-            }
-
-    # Send to TradersPost
-    try:
-        tp_resp = _post_to_traderspost(symbol, action)
-    except Exception as e:
-        print(f"[ERROR] TradersPost post failed: {e}")
-        return {"status": "error", "symbol": symbol, "error": str(e)}
-
-    print(f"[SENT] {action.upper()} {symbol} | TradersPost response: {tp_resp}")
-
-    if action == "buy":
-        _state["buy_count"] += 1
-        _state["bought_symbols"].add(symbol)
-        print(f"[COUNT] buy_count={_state['buy_count']} / {MAX_BUYS_PER_DAY}")
+    print(f"[DECISION] {action.upper()} {symbol} ({reason}). Open now: {len(_open_positions)}/{MAX_OPEN_POSITIONS}")
+    _send_to_traderspost(symbol, action)
 
     return {
         "status": "sent",
         "symbol": symbol,
         "action": action,
-        "date_tz": _state["date"],
-        "buy_count": _state["buy_count"],
-        "max_buys_per_day": MAX_BUYS_PER_DAY,
-        "traderspost_response": tp_resp,
+        "open_positions": len(_open_positions),
+        "max_open_positions": MAX_OPEN_POSITIONS,
     }
+
+# ====== SCHEDULER FAILSAFE ======
+scheduler = BackgroundScheduler(timezone=FLATTEN_TZ)
+if ENABLE_FLATTEN_FAILSAFE:
+    scheduler.add_job(
+        _flatten_all,
+        CronTrigger(day_of_week="mon-fri", hour=FLATTEN_HOUR, minute=FLATTEN_MINUTE),
+        id="flatten_failsafe",
+        replace_existing=True,
+    )
+    print(f"[SCHEDULER] Failsafe FLATTEN enabled at {FLATTEN_HOUR:02d}:{FLATTEN_MINUTE:02d} ({FLATTEN_TZ}) Mon–Fri")
+else:
+    print("[SCHEDULER] Failsafe FLATTEN disabled")
+
+scheduler.start()
