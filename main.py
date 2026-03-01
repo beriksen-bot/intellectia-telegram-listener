@@ -1,139 +1,180 @@
 import os
 import re
 import threading
-from datetime import datetime
+from datetime import datetime, date
 from zoneinfo import ZoneInfo
 
 import requests
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 app = FastAPI()
 
-TRADERSPOST_WEBHOOK = os.getenv("TRADERSPOST_WEBHOOK")  # e.g. https://webhooks.traderspost.io/trading/webhook/...
+# ====== CONFIG ======
+TRADERSPOST_WEBHOOK = os.getenv("TRADERSPOST_WEBHOOK")  # required
 if not TRADERSPOST_WEBHOOK:
     raise RuntimeError("Missing env var TRADERSPOST_WEBHOOK")
 
-# Timezone for Utah
+# Utah time (Mountain). America/Denver handles DST correctly.
 MT = ZoneInfo("America/Denver")
 
-# Keep a simple in-memory set of symbols we've bought and not yet flattened.
-# (This resets if Railway restarts — good enough for a daily flatten.)
-open_symbols = set()
-lock = threading.Lock()
+# Failsafe: set to "true" to flatten all tracked positions at 1:50pm MT Mon-Fri.
+ENABLE_FLATTEN_FAILSAFE = os.getenv("ENABLE_FLATTEN_FAILSAFE", "true").lower() in ("1", "true", "yes", "y")
 
-# Regex that matches your Intellectia message format:
-# "Symbol SOUN has a daytrading signal!"
+# Flatten time (defaults to 13:50 MT)
+FLATTEN_HOUR = int(os.getenv("FLATTEN_HOUR", "13"))
+FLATTEN_MINUTE = int(os.getenv("FLATTEN_MINUTE", "50"))
+
+# ====== STATE (in-memory) ======
+# Tracks today's "signal count" per symbol so we can do: 1st=buy, 2nd=sell
+state_lock = threading.Lock()
+today_key = None  # will hold date() in MT
+signal_count_by_symbol = {}  # { "AAPL": 1 } etc
+open_symbols = set()  # symbols we have bought and not yet sold (best effort)
+
+
+# ====== HELPERS ======
 SYMBOL_RE = re.compile(r"\bSymbol\s+([A-Z]{1,10})\b", re.IGNORECASE)
 
-
 def _extract_text(update: dict) -> str:
-    """
-    Telegram updates can deliver content as:
-      - update["message"]["text"]
-      - update["message"]["caption"] (media messages)
-      - update["channel_post"]["text"] / ["caption"] (channels)
-    """
-    msg = update.get("message") or update.get("channel_post") or {}
+    """Pull Telegram text from message/channel_post, and from text/caption."""
+    msg = (
+        update.get("message")
+        or update.get("edited_message")
+        or update.get("channel_post")
+        or update.get("edited_channel_post")
+        or {}
+    )
     return (msg.get("text") or msg.get("caption") or "").strip()
 
+def _roll_day_if_needed():
+    """Reset state when the day changes in Mountain Time."""
+    global today_key, signal_count_by_symbol, open_symbols
+    now_mt = datetime.now(MT)
+    d = now_mt.date()
+    with state_lock:
+        if today_key != d:
+            today_key = d
+            signal_count_by_symbol = {}
+            open_symbols = set()
+            print(f"[STATE] New day detected ({today_key}). State reset.")
 
-def _post_to_traderspost(ticker: str, action: str) -> dict:
+def _post_to_traderspost(ticker: str, action: str) -> str:
+    """Send buy/sell to TradersPost webhook."""
     payload = {"ticker": ticker, "action": action}
     r = requests.post(TRADERSPOST_WEBHOOK, json=payload, timeout=15)
-    try:
-        body = r.json()
-    except Exception:
-        body = {"raw": r.text}
+    return f"{r.status_code} {r.text[:300]}"
 
-    if r.status_code >= 400:
-        raise HTTPException(status_code=502, detail={"status": r.status_code, "body": body})
-    return body
+def _decide_action(symbol: str) -> str:
+    """
+    Your rule:
+      - 1st signal today => BUY
+      - 2nd signal today => SELL
+      - 3rd => BUY (if it happens again), 4th => SELL, etc.
+    """
+    _roll_day_if_needed()
+
+    with state_lock:
+        c = signal_count_by_symbol.get(symbol, 0) + 1
+        signal_count_by_symbol[symbol] = c
+
+        # Odd = buy, even = sell
+        action = "buy" if (c % 2 == 1) else "sell"
+
+        # Track opens best-effort
+        if action == "buy":
+            open_symbols.add(symbol)
+        else:
+            open_symbols.discard(symbol)
+
+    return action
+
+def flatten_all_open_positions():
+    """Failsafe sell: closes everything we think is still open."""
+    _roll_day_if_needed()
+
+    with state_lock:
+        symbols = sorted(list(open_symbols))
+
+    if not symbols:
+        print(f"[FLATTEN] Nothing to flatten @ {datetime.now(MT).isoformat()}")
+        return
+
+    print(f"[FLATTEN] Selling all open symbols {symbols} @ {datetime.now(MT).isoformat()}")
+
+    for sym in symbols:
+        try:
+            resp = _post_to_traderspost(sym, "sell")
+            print(f"[FLATTEN] SELL {sym} -> {resp}")
+        except Exception as e:
+            print(f"[FLATTEN] ERROR selling {sym}: {e}")
+
+    # Clear after attempting
+    with state_lock:
+        for sym in symbols:
+            open_symbols.discard(sym)
+
+    print("[FLATTEN] Done.")
 
 
+# ====== ROUTES ======
 @app.get("/health")
 def health():
-    return {"ok": True, "open_symbols": sorted(list(open_symbols))}
+    _roll_day_if_needed()
+    with state_lock:
+        return {
+            "ok": True,
+            "date_mt": str(today_key),
+            "open_symbols": sorted(list(open_symbols)),
+            "signal_counts": dict(sorted(signal_count_by_symbol.items()))
+        }
 
+@app.post("/flatten-now")
+def flatten_now():
+    """Manual test endpoint: hit this to force a flatten immediately."""
+    flatten_all_open_positions()
+    return {"ok": True}
 
 @app.post("/telegram/webhook")
 async def telegram_webhook(request: Request):
     update = await request.json()
-
     text = _extract_text(update)
-    print("Received text/caption:", text)
 
+    # Log what we received (trimmed)
+    print("[TELEGRAM] Received:", text[:300])
+
+    # Find Symbol <TICKER>
     m = SYMBOL_RE.search(text)
     if not m:
-        return {"status": "no symbol found"}
+        return {"status": "ignored", "reason": "no Symbol <TICKER> found"}
 
     symbol = m.group(1).upper()
-    print("Parsed symbol:", symbol)
+    action = _decide_action(symbol)
 
-    # Send BUY signal to TradersPost
-    resp = _post_to_traderspost(symbol, "buy")
-    print("TradersPost response:", resp)
+    print(f"[LOGIC] {symbol} -> {action.upper()} (paired mode)")
 
-    # Track as open so we can flatten later
-    with lock:
-        open_symbols.add(symbol)
-
-    return {"status": "sent", "symbol": symbol, "traderspost": resp}
-
-
-def flatten_all_open_positions():
-    """
-    Sells every symbol we've seen a BUY for (since last restart),
-    then clears the list.
-    """
-    with lock:
-        symbols = sorted(list(open_symbols))
-
-    if not symbols:
-        print("Flatten: nothing to do")
-        return
-
-    print(f"Flatten: selling {symbols} @ {datetime.now(MT).isoformat()}")
-
-    failures = []
-    for sym in symbols:
-        try:
-            _post_to_traderspost(sym, "sell")
-        except Exception as e:
-            failures.append((sym, str(e)))
-
-    if failures:
-        print("Flatten failures:", failures)
-        # Keep failures in the set so we try again next day
-        with lock:
-            for sym, _ in failures:
-                open_symbols.add(sym)
-            for sym in symbols:
-                if sym not in dict(failures):
-                    open_symbols.discard(sym)
-        return
-
-    # All succeeded
-    with lock:
-        for sym in symbols:
-            open_symbols.discard(sym)
-
-    print("Flatten: complete")
+    try:
+        resp = _post_to_traderspost(symbol, action)
+        print(f"[TRADERSPOST] {action.upper()} {symbol} -> {resp}")
+        return {"status": "sent", "symbol": symbol, "action": action}
+    except Exception as e:
+        print(f"[ERROR] Posting to TradersPost failed: {e}")
+        return {"status": "error", "error": str(e), "symbol": symbol, "action": action}
 
 
-@app.post("/flatten-now")
-def flatten_now():
-    flatten_all_open_positions()
-    return {"ok": True}
-
-
-# Schedule flatten at 1:50pm Utah time, Mon-Fri
+# ====== SCHEDULER (failsafe flatten) ======
 scheduler = BackgroundScheduler(timezone=MT)
-scheduler.add_job(
-    flatten_all_open_positions,
-    CronTrigger(day_of_week="mon-fri", hour=13, minute=50),
-    id="flatten_1350_mt",
-    replace_existing=True,
-)
+
+if ENABLE_FLATTEN_FAILSAFE:
+    scheduler.add_job(
+        flatten_all_open_positions,
+        CronTrigger(day_of_week="mon-fri", hour=FLATTEN_HOUR, minute=FLATTEN_MINUTE),
+        id="flatten_failsafe",
+        replace_existing=True,
+    )
+    print(f"[SCHEDULER] Flatten failsafe ENABLED at {FLATTEN_HOUR:02d}:{FLATTEN_MINUTE:02d} MT Mon-Fri")
+else:
+    print("[SCHEDULER] Flatten failsafe DISABLED")
+
 scheduler.start()
