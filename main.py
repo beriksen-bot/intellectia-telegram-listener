@@ -1,310 +1,239 @@
 import os
 import re
-import threading
-from datetime import datetime, time
-from zoneinfo import ZoneInfo
+import json
+import asyncio
+from datetime import datetime
+from typing import Optional, Set
 
-import requests
-from fastapi import FastAPI, Request, Header, HTTPException
+import aiohttp
+from fastapi import FastAPI
+import uvicorn
 
-from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.triggers.cron import CronTrigger
+from telethon import TelegramClient, events
+from telethon.sessions import StringSession
 
+# -----------------------
+# Config helpers
+# -----------------------
+def env(name: str, default: Optional[str] = None) -> str:
+    v = os.getenv(name, default)
+    if v is None or v == "":
+        raise RuntimeError(f"Missing required env var: {name}")
+    return v
+
+def env_bool(name: str, default: str = "false") -> bool:
+    return os.getenv(name, default).strip().lower() in ("1", "true", "yes", "y", "on")
+
+def parse_csv_set(value: str) -> Set[str]:
+    return {x.strip().upper() for x in (value or "").split(",") if x.strip()}
+
+# -----------------------
+# Environment
+# -----------------------
+API_ID = int(env("API_ID"))
+API_HASH = env("API_HASH")
+SESSION_STRING = env("SESSION_STRING")
+
+# DT Relay can be -100... or @username; we support both.
+SOURCE_CHAT_RAW = env("SOURCE_CHAT")
+
+TRADERSPOST_WEBHOOK = env("TRADERSPOST_WEBHOOK")
+
+BLACKLIST = parse_csv_set(os.getenv("BLACKLIST", ""))
+
+BUY_WINDOW_ENABLED = env_bool("BUY_WINDOW_ENABLED", "false")
+BUY_WINDOW_START = os.getenv("BUY_WINDOW_START", "09:30")   # HH:MM
+BUY_WINDOW_END = os.getenv("BUY_WINDOW_END", "16:00")       # HH:MM
+BUY_WINDOW_TZ = os.getenv("BUY_WINDOW_TZ", "America/New_York")
+
+MAX_BUYS_PER_DAY = int(os.getenv("MAX_BUYS_PER_DAY", "999999"))
+
+# Regex for the Intellectia message format
+SYMBOL_RE = re.compile(r"\bSymbol\s+([A-Z.\-]{1,10})\b", re.IGNORECASE)
+
+# -----------------------
+# State
+# -----------------------
 app = FastAPI()
+client: Optional[TelegramClient] = None
 
-# =========================
-# CONFIG
-# =========================
-TRADERSPOST_WEBHOOK = os.getenv("TRADERSPOST_WEBHOOK", "").strip()
-if not TRADERSPOST_WEBHOOK:
-    raise RuntimeError("Missing env var TRADERSPOST_WEBHOOK")
+buy_count_today = 0
+buy_count_date = None  # YYYY-MM-DD in BUY_WINDOW_TZ
 
-# Optional: If set, we will require Telegram's secret token header to match.
-# When you setWebhook, you can provide secret_token=YOURVALUE
-TELEGRAM_SECRET_TOKEN = os.getenv("TELEGRAM_SECRET_TOKEN", "").strip()
+# -----------------------
+# Time window
+# -----------------------
+def now_in_tz(tz_name: str) -> datetime:
+    # Python 3.9+ zoneinfo is standard
+    from zoneinfo import ZoneInfo
+    return datetime.now(ZoneInfo(tz_name))
 
-MAX_BUYS_PER_DAY = int(os.getenv("MAX_BUYS_PER_DAY", "5"))
-
-# Utah time (handles DST correctly)
-MT = ZoneInfo(os.getenv("TZ_NAME", "America/Denver"))
-
-# --- BUY WINDOW (defaults to ET) ---
-BUY_WINDOW_ENABLED = os.getenv("BUY_WINDOW_ENABLED", "true").lower() in ("1", "true", "yes", "y")
-BUY_WINDOW_TZ = ZoneInfo(os.getenv("BUY_WINDOW_TZ", "America/New_York"))
-BUY_WINDOW_START = os.getenv("BUY_WINDOW_START", "09:00")  # HH:MM
-BUY_WINDOW_END = os.getenv("BUY_WINDOW_END", "11:00")      # HH:MM
-
-# --- BLACKLIST ---
-BLACKLIST_RAW = os.getenv("BLACKLIST", "")
-BLACKLIST = {s.strip().upper() for s in BLACKLIST_RAW.split(",") if s.strip()}
-
-# Failsafe flatten (defaults 13:55 MT)
-ENABLE_FLATTEN_FAILSAFE = os.getenv("ENABLE_FLATTEN_FAILSAFE", "true").lower() in ("1", "true", "yes", "y")
-FLATTEN_HOUR = int(os.getenv("FLATTEN_HOUR", "13"))
-FLATTEN_MINUTE = int(os.getenv("FLATTEN_MINUTE", "55"))
-
-# Match Intellectia format: "Symbol CIEN has a daytrading signal!"
-SYMBOL_RE = re.compile(r"\bSymbol\s+([A-Z]{1,10})\b", re.IGNORECASE)
-
-# =========================
-# STATE (in-memory)
-# =========================
-lock = threading.Lock()
-today_date = None  # date in MT
-signal_count_by_symbol = {}  # {"AAPL": 1, ...} counts signals today per ticker
-buy_count_today = 0          # number of BUYs sent today
-open_positions = set()       # best-effort tracking for failsafe flatten
-
-
-# =========================
-# HELPERS
-# =========================
-def parse_hhmm(s: str) -> time:
-    hh, mm = s.strip().split(":")
-    return time(int(hh), int(mm))
-
-
-BUY_START_T = parse_hhmm(BUY_WINDOW_START)
-BUY_END_T = parse_hhmm(BUY_WINDOW_END)
-
-
-def in_time_window(now_t: time, start_t: time, end_t: time) -> bool:
-    """
-    True if now_t is within [start_t, end_t).
-    Supports windows crossing midnight.
-    """
-    if start_t == end_t:
-        return True
-    if start_t < end_t:
-        return start_t <= now_t < end_t
-    return now_t >= start_t or now_t < end_t
-
-
-def buy_window_open_now() -> bool:
+def within_buy_window() -> bool:
     if not BUY_WINDOW_ENABLED:
         return True
-    now = datetime.now(BUY_WINDOW_TZ)
-    now_t = now.time().replace(second=0, microsecond=0)
-    return in_time_window(now_t, BUY_START_T, BUY_END_T)
+    n = now_in_tz(BUY_WINDOW_TZ)
+    hhmm = f"{n.hour:02d}:{n.minute:02d}"
+    return BUY_WINDOW_START <= hhmm <= BUY_WINDOW_END
 
+def reset_daily_counter_if_needed():
+    global buy_count_today, buy_count_date
+    n = now_in_tz(BUY_WINDOW_TZ)
+    d = n.date().isoformat()
+    if buy_count_date != d:
+        buy_count_date = d
+        buy_count_today = 0
 
-def reset_if_new_day() -> None:
-    """Reset counters when the day changes in MT."""
-    global today_date, signal_count_by_symbol, buy_count_today, open_positions
-    d = datetime.now(MT).date()
-    with lock:
-        if today_date != d:
-            today_date = d
-            signal_count_by_symbol = {}
-            buy_count_today = 0
-            open_positions = set()
-
-            print("=================================")
-            print(f"[RESET] New trading day (MT): {today_date}")
-            print(f"[BUY COUNT] {buy_count_today} / {MAX_BUYS_PER_DAY}")
-            if BLACKLIST:
-                print(f"[BLACKLIST] {sorted(BLACKLIST)}")
-            print(
-                f"[BUY WINDOW] enabled={BUY_WINDOW_ENABLED} tz={BUY_WINDOW_TZ.key} "
-                f"{BUY_WINDOW_START}->{BUY_WINDOW_END}"
-            )
-            print("=================================")
-
-
-def extract_text(update: dict) -> str:
+# -----------------------
+# TradersPost call
+# -----------------------
+async def post_to_traderspost(symbol: str, raw_text: str) -> bool:
     """
-    Telegram updates can store content in multiple places; handle all common ones.
-    - message
-    - channel_post  (important for channels like DT Relay)
+    Sends a signal payload to TradersPost.
+    Adjust payload keys here if your TradersPost endpoint expects something different.
     """
-    msg = (
-        update.get("message")
-        or update.get("edited_message")
-        or update.get("channel_post")
-        or update.get("edited_channel_post")
-        or {}
-    )
-    return (msg.get("text") or msg.get("caption") or "").strip()
+    payload = {
+        "symbol": symbol,
+        "action": "BUY",
+        "source": "DT Relay (Telethon)",
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "raw_text": raw_text,
+    }
 
+    async with aiohttp.ClientSession() as session:
+        async with session.post(TRADERSPOST_WEBHOOK, json=payload, timeout=20) as resp:
+            text = await resp.text()
+            ok = 200 <= resp.status < 300
+            print(f"[TRADERSPOST] status={resp.status} ok={ok} response={text[:500]}")
+            return ok
 
-def parse_symbol(text: str):
-    m = SYMBOL_RE.search(text or "")
-    return m.group(1).upper() if m else None
-
-
-def post_to_traderspost(symbol: str, action: str) -> None:
-    payload = {"ticker": symbol, "action": action}
-    r = requests.post(TRADERSPOST_WEBHOOK, json=payload, timeout=20)
-    print(f"[TRADERSPOST] {action.upper()} {symbol} -> {r.status_code} {r.text[:250]}")
-    r.raise_for_status()
-
-
-def decide_action(symbol: str):
+# -----------------------
+# Chat resolution
+# -----------------------
+async def resolve_chat(chat_raw: str):
     """
-    Pairing logic (per ticker, per day):
-      - 1st signal -> BUY (if under daily buy limit AND within buy window)
-      - 2nd signal -> SELL (only if we believe we opened it)
-      - 3rd -> BUY ...
+    Supports:
+      - numeric ids (including -100... form)
+      - @usernames
+      - plain names (best-effort)
     """
-    global buy_count_today
+    chat_raw = chat_raw.strip()
 
-    reset_if_new_day()
+    # Numeric ID?
+    if re.fullmatch(r"-?\d+", chat_raw):
+        return int(chat_raw)
 
-    if symbol in BLACKLIST:
-        print(f"[BLOCKED] {symbol} is blacklisted — ignoring signal.")
-        return None, "blacklisted"
+    # Username like @DT_Relay (not typical for private channels)
+    if chat_raw.startswith("@"):
+        return chat_raw
 
-    with lock:
-        current = signal_count_by_symbol.get(symbol, 0)
-        next_count = current + 1
+    # Otherwise treat as a name; Telethon can often resolve by entity
+    return chat_raw
 
-        # Odd signals => BUY attempt
-        if next_count % 2 == 1:
-            if buy_count_today >= MAX_BUYS_PER_DAY:
-                print(f"[LIMIT] Max buys reached: {buy_count_today}/{MAX_BUYS_PER_DAY} — BLOCK BUY {symbol}")
-                return None, "max_buys_reached"
+# -----------------------
+# Telegram handler
+# -----------------------
+async def start_telethon_listener():
+    global client
 
-            if not buy_window_open_now():
-                now_local = datetime.now(BUY_WINDOW_TZ).strftime("%H:%M")
-                print(
-                    f"[WINDOW] Outside buy window ({BUY_WINDOW_START}-{BUY_WINDOW_END} {BUY_WINDOW_TZ.key}). "
-                    f"Now={now_local}. BLOCK BUY {symbol}"
-                )
-                # IMPORTANT: do NOT increment the signal count if we block the BUY
-                return None, "outside_buy_window"
+    print("[BOOT] Starting listener userbot...")
+    print(f"[BOOT] SOURCE_CHAT={SOURCE_CHAT_RAW}")
+    print(f"[BOOT] BUY_WINDOW_ENABLED={BUY_WINDOW_ENABLED} {BUY_WINDOW_START}-{BUY_WINDOW_END} {BUY_WINDOW_TZ}")
+    print(f"[BOOT] BLACKLIST={sorted(list(BLACKLIST))}")
+    print(f"[BOOT] MAX_BUYS_PER_DAY={MAX_BUYS_PER_DAY}")
 
-            # Allowed BUY: commit count + state
-            signal_count_by_symbol[symbol] = next_count
-            buy_count_today += 1
-            open_positions.add(symbol)
+    client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+    await client.start()
+    me = await client.get_me()
+    print(f"[BOOT] Logged in as: {getattr(me, 'first_name', '')} (id={me.id})")
 
-            print(f"[BUY] {symbol}")
-            print(f"[BUY COUNT] {buy_count_today} / {MAX_BUYS_PER_DAY}")
-            return "buy", None
+    source_entity = await resolve_chat(SOURCE_CHAT_RAW)
+    try:
+        # Warm up / validate resolution
+        resolved = await client.get_entity(source_entity)
+        print(f"[RESOLVE] SOURCE_CHAT resolved: name={getattr(resolved, 'title', getattr(resolved, 'username', ''))} id={resolved.id}")
+    except Exception as e:
+        print(f"[ERROR] Could not resolve SOURCE_CHAT={SOURCE_CHAT_RAW}: {e}")
+        raise
 
-        # Even signals => SELL attempt
-        if symbol not in open_positions:
-            print(f"[SELL-BLOCKED] {symbol} has no tracked open position — ignoring SELL signal.")
-            # Do NOT increment counter to avoid drift
-            return None, "no_open_position"
+    @client.on(events.NewMessage(chats=source_entity))
+    async def on_new_message(event):
+        global buy_count_today
 
-        # Allowed SELL: commit count + state
-        signal_count_by_symbol[symbol] = next_count
-        open_positions.discard(symbol)
-
-        print(f"[SELL] {symbol}")
-        print(f"[BUY COUNT] still {buy_count_today} / {MAX_BUYS_PER_DAY}")
-        return "sell", None
-
-
-def flatten_all_open_positions() -> None:
-    """Failsafe: sell everything we think is still open (best-effort)."""
-    reset_if_new_day()
-    with lock:
-        symbols = sorted(open_positions)
-
-    if not symbols:
-        print(f"[FAILSAFE] Flatten @ {datetime.now(MT).isoformat()} — nothing open.")
-        return
-
-    print(f"[FAILSAFE] Flatten @ {datetime.now(MT).isoformat()} — closing: {symbols}")
-    for sym in symbols:
         try:
-            post_to_traderspost(sym, "sell")
+            text = event.raw_text or ""
+            if not text.strip():
+                return
+
+            # Extract symbol
+            m = SYMBOL_RE.search(text)
+            if not m:
+                # If DT Relay forwards the whole message, it usually contains "Symbol XXX"
+                # If not, ignore silently.
+                print("[SKIP] No symbol found in message.")
+                return
+
+            symbol = m.group(1).upper()
+
+            reset_daily_counter_if_needed()
+
+            if symbol in BLACKLIST:
+                print(f"[SKIP] {symbol} is blacklisted")
+                return
+
+            if not within_buy_window():
+                print(f"[SKIP] Outside buy window ({BUY_WINDOW_TZ} {BUY_WINDOW_START}-{BUY_WINDOW_END}) symbol={symbol}")
+                return
+
+            if buy_count_today >= MAX_BUYS_PER_DAY:
+                print(f"[SKIP] Max buys per day reached ({buy_count_today}/{MAX_BUYS_PER_DAY})")
+                return
+
+            print(f"[SIGNAL] symbol={symbol} (buy_count_today={buy_count_today})")
+
+            ok = await post_to_traderspost(symbol, text)
+            if ok:
+                buy_count_today += 1
+                print(f"[OK] Sent to TradersPost. buy_count_today={buy_count_today}")
+            else:
+                print("[WARN] TradersPost call failed (non-2xx).")
+
         except Exception as e:
-            print(f"[FAILSAFE][ERROR] SELL {sym} failed: {e}")
+            print(f"[ERROR] Handler exception: {e}")
 
-    with lock:
-        open_positions.clear()
-    print("[FAILSAFE] Flatten complete.")
+    print("[OK] Listening for messages from DT Relay...")
+    # Keep running forever
+    await client.run_until_disconnected()
 
-
-# =========================
-# ROUTES
-# =========================
+# -----------------------
+# FastAPI endpoints (health)
+# -----------------------
 @app.get("/health")
 def health():
-    reset_if_new_day()
-    with lock:
-        return {
-            "ok": True,
-            "date_mt": str(today_date),
-            "buy_count_today": buy_count_today,
-            "max_buys_per_day": MAX_BUYS_PER_DAY,
-            "open_positions": sorted(open_positions),
-            "blacklist": sorted(BLACKLIST),
-            "buy_window": {
-                "enabled": BUY_WINDOW_ENABLED,
-                "tz": BUY_WINDOW_TZ.key,
-                "start": BUY_WINDOW_START,
-                "end": BUY_WINDOW_END,
-            },
-        }
+    reset_daily_counter_if_needed()
+    return {
+        "ok": True,
+        "date_tz": BUY_WINDOW_TZ,
+        "date": buy_count_date,
+        "buy_count_today": buy_count_today,
+        "max_buys_per_day": MAX_BUYS_PER_DAY,
+        "buy_window": {
+            "enabled": BUY_WINDOW_ENABLED,
+            "start": BUY_WINDOW_START,
+            "end": BUY_WINDOW_END,
+            "tz": BUY_WINDOW_TZ,
+        },
+        "blacklist": sorted(list(BLACKLIST)),
+        "source_chat": SOURCE_CHAT_RAW,
+    }
 
+@app.on_event("startup")
+async def _startup():
+    # Run listener in background so uvicorn can serve /health
+    asyncio.create_task(start_telethon_listener())
 
-@app.post("/flatten-now")
-def flatten_now():
-    flatten_all_open_positions()
-    return {"ok": True}
-
-
-@app.post("/telegram/webhook")
-async def telegram_webhook(
-    request: Request,
-    x_telegram_bot_api_secret_token: str | None = Header(default=None),
-):
-    # Optional protection: enforce Telegram secret token header
-    if TELEGRAM_SECRET_TOKEN:
-        if not x_telegram_bot_api_secret_token or x_telegram_bot_api_secret_token != TELEGRAM_SECRET_TOKEN:
-            raise HTTPException(status_code=401, detail="Unauthorized")
-
-    update = await request.json()
-    reset_if_new_day()
-
-    text = extract_text(update)
-    if text:
-        print(f"[RX] {text[:400]}")
-    else:
-        # still return 200 so Telegram doesn't retry aggressively
-        return {"status": "ignored", "reason": "no text/caption"}
-
-    symbol = parse_symbol(text)
-    if not symbol:
-        return {"status": "ignored", "reason": "no Symbol <TICKER> found"}
-
-    action, reason = decide_action(symbol)
-    if action is None:
-        return {
-            "status": "blocked",
-            "symbol": symbol,
-            "reason": reason,
-            "buy_count_today": buy_count_today,
-            "max_buys_per_day": MAX_BUYS_PER_DAY,
-        }
-
-    try:
-        post_to_traderspost(symbol, action)
-    except Exception as e:
-        print(f"[ERROR] TradersPost post failed for {symbol} {action}: {e}")
-        return {"status": "error", "symbol": symbol, "action": action, "error": str(e)}
-
-    return {"status": "sent", "symbol": symbol, "action": action}
-
-
-# =========================
-# SCHEDULER (Failsafe)
-# =========================
-scheduler = BackgroundScheduler(timezone=MT)
-
-if ENABLE_FLATTEN_FAILSAFE:
-    scheduler.add_job(
-        flatten_all_open_positions,
-        CronTrigger(day_of_week="mon-fri", hour=FLATTEN_HOUR, minute=FLATTEN_MINUTE),
-        id="flatten_failsafe",
-        replace_existing=True,
-    )
-    print(f"[SCHEDULER] Failsafe flatten ENABLED at {FLATTEN_HOUR:02d}:{FLATTEN_MINUTE:02d} {MT.key} (Mon–Fri)")
-else:
-    print("[SCHEDULER] Failsafe flatten DISABLED")
-
-scheduler.start()
+# -----------------------
+# Entrypoint
+# -----------------------
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", "8080"))
+    uvicorn.run(app, host="0.0.0.0", port=port)
