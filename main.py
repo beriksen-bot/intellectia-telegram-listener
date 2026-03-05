@@ -5,7 +5,7 @@ from datetime import datetime, time
 from zoneinfo import ZoneInfo
 
 import requests
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Header, HTTPException
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -19,22 +19,26 @@ TRADERSPOST_WEBHOOK = os.getenv("TRADERSPOST_WEBHOOK", "").strip()
 if not TRADERSPOST_WEBHOOK:
     raise RuntimeError("Missing env var TRADERSPOST_WEBHOOK")
 
+# Optional: If set, we will require Telegram's secret token header to match.
+# When you setWebhook, you can provide secret_token=YOURVALUE
+TELEGRAM_SECRET_TOKEN = os.getenv("TELEGRAM_SECRET_TOKEN", "").strip()
+
 MAX_BUYS_PER_DAY = int(os.getenv("MAX_BUYS_PER_DAY", "5"))
 
 # Utah time (handles DST correctly)
-MT = ZoneInfo("America/Denver")
+MT = ZoneInfo(os.getenv("TZ_NAME", "America/Denver"))
 
 # --- BUY WINDOW (defaults to ET) ---
 BUY_WINDOW_ENABLED = os.getenv("BUY_WINDOW_ENABLED", "true").lower() in ("1", "true", "yes", "y")
 BUY_WINDOW_TZ = ZoneInfo(os.getenv("BUY_WINDOW_TZ", "America/New_York"))
-BUY_WINDOW_START = os.getenv("BUY_WINDOW_START", "09:00")
-BUY_WINDOW_END = os.getenv("BUY_WINDOW_END", "11:00")
+BUY_WINDOW_START = os.getenv("BUY_WINDOW_START", "09:00")  # HH:MM
+BUY_WINDOW_END = os.getenv("BUY_WINDOW_END", "11:00")      # HH:MM
 
 # --- BLACKLIST ---
 BLACKLIST_RAW = os.getenv("BLACKLIST", "")
 BLACKLIST = {s.strip().upper() for s in BLACKLIST_RAW.split(",") if s.strip()}
 
-# Failsafe flatten at 1:55pm Utah time (13:55)
+# Failsafe flatten (defaults 13:55 MT)
 ENABLE_FLATTEN_FAILSAFE = os.getenv("ENABLE_FLATTEN_FAILSAFE", "true").lower() in ("1", "true", "yes", "y")
 FLATTEN_HOUR = int(os.getenv("FLATTEN_HOUR", "13"))
 FLATTEN_MINUTE = int(os.getenv("FLATTEN_MINUTE", "55"))
@@ -56,7 +60,6 @@ open_positions = set()       # best-effort tracking for failsafe flatten
 # HELPERS
 # =========================
 def parse_hhmm(s: str) -> time:
-    # expects "HH:MM"
     hh, mm = s.strip().split(":")
     return time(int(hh), int(mm))
 
@@ -78,9 +81,6 @@ def in_time_window(now_t: time, start_t: time, end_t: time) -> bool:
 
 
 def buy_window_open_now() -> bool:
-    """
-    Window check in BUY_WINDOW_TZ (defaults ET).
-    """
     if not BUY_WINDOW_ENABLED:
         return True
     now = datetime.now(BUY_WINDOW_TZ)
@@ -89,9 +89,8 @@ def buy_window_open_now() -> bool:
 
 
 def reset_if_new_day() -> None:
-    """Reset counters when the day changes in Utah time."""
+    """Reset counters when the day changes in MT."""
     global today_date, signal_count_by_symbol, buy_count_today, open_positions
-
     d = datetime.now(MT).date()
     with lock:
         if today_date != d:
@@ -105,12 +104,19 @@ def reset_if_new_day() -> None:
             print(f"[BUY COUNT] {buy_count_today} / {MAX_BUYS_PER_DAY}")
             if BLACKLIST:
                 print(f"[BLACKLIST] {sorted(BLACKLIST)}")
-            print(f"[BUY WINDOW] enabled={BUY_WINDOW_ENABLED} tz={BUY_WINDOW_TZ.key} {BUY_WINDOW_START}->{BUY_WINDOW_END}")
+            print(
+                f"[BUY WINDOW] enabled={BUY_WINDOW_ENABLED} tz={BUY_WINDOW_TZ.key} "
+                f"{BUY_WINDOW_START}->{BUY_WINDOW_END}"
+            )
             print("=================================")
 
 
 def extract_text(update: dict) -> str:
-    """Telegram updates can store content in multiple places; handle all common ones."""
+    """
+    Telegram updates can store content in multiple places; handle all common ones.
+    - message
+    - channel_post  (important for channels like DT Relay)
+    """
     msg = (
         update.get("message")
         or update.get("edited_message")
@@ -128,8 +134,9 @@ def parse_symbol(text: str):
 
 def post_to_traderspost(symbol: str, action: str) -> None:
     payload = {"ticker": symbol, "action": action}
-    r = requests.post(TRADERSPOST_WEBHOOK, json=payload, timeout=15)
+    r = requests.post(TRADERSPOST_WEBHOOK, json=payload, timeout=20)
     print(f"[TRADERSPOST] {action.upper()} {symbol} -> {r.status_code} {r.text[:250]}")
+    r.raise_for_status()
 
 
 def decide_action(symbol: str):
@@ -143,12 +150,10 @@ def decide_action(symbol: str):
 
     reset_if_new_day()
 
-    # Hard ignore blacklisted symbols (no counting, no trades)
     if symbol in BLACKLIST:
         print(f"[BLOCKED] {symbol} is blacklisted — ignoring signal.")
         return None, "blacklisted"
 
-    # We decide based on what the *next* count would be, but only commit it if allowed.
     with lock:
         current = signal_count_by_symbol.get(symbol, 0)
         next_count = current + 1
@@ -160,9 +165,12 @@ def decide_action(symbol: str):
                 return None, "max_buys_reached"
 
             if not buy_window_open_now():
-                now_et = datetime.now(BUY_WINDOW_TZ).strftime("%H:%M")
-                print(f"[WINDOW] Outside buy window ({BUY_WINDOW_START}-{BUY_WINDOW_END} {BUY_WINDOW_TZ.key}). Now={now_et}. BLOCK BUY {symbol}")
-                # IMPORTANT: do NOT increment signal count (prevents afternoon sell turning into buy)
+                now_local = datetime.now(BUY_WINDOW_TZ).strftime("%H:%M")
+                print(
+                    f"[WINDOW] Outside buy window ({BUY_WINDOW_START}-{BUY_WINDOW_END} {BUY_WINDOW_TZ.key}). "
+                    f"Now={now_local}. BLOCK BUY {symbol}"
+                )
+                # IMPORTANT: do NOT increment the signal count if we block the BUY
                 return None, "outside_buy_window"
 
             # Allowed BUY: commit count + state
@@ -175,10 +183,9 @@ def decide_action(symbol: str):
             return "buy", None
 
         # Even signals => SELL attempt
-        # Only SELL if we think we actually opened it
         if symbol not in open_positions:
             print(f"[SELL-BLOCKED] {symbol} has no tracked open position — ignoring SELL signal.")
-            # We also do NOT increment the counter in this case to avoid drifting state.
+            # Do NOT increment counter to avoid drift
             return None, "no_open_position"
 
         # Allowed SELL: commit count + state
@@ -193,7 +200,6 @@ def decide_action(symbol: str):
 def flatten_all_open_positions() -> None:
     """Failsafe: sell everything we think is still open (best-effort)."""
     reset_if_new_day()
-
     with lock:
         symbols = sorted(open_positions)
 
@@ -238,18 +244,29 @@ def health():
 
 @app.post("/flatten-now")
 def flatten_now():
-    """Manual test endpoint."""
     flatten_all_open_positions()
     return {"ok": True}
 
 
 @app.post("/telegram/webhook")
-async def telegram_webhook(request: Request):
+async def telegram_webhook(
+    request: Request,
+    x_telegram_bot_api_secret_token: str | None = Header(default=None),
+):
+    # Optional protection: enforce Telegram secret token header
+    if TELEGRAM_SECRET_TOKEN:
+        if not x_telegram_bot_api_secret_token or x_telegram_bot_api_secret_token != TELEGRAM_SECRET_TOKEN:
+            raise HTTPException(status_code=401, detail="Unauthorized")
+
     update = await request.json()
     reset_if_new_day()
 
     text = extract_text(update)
-    print(f"[RX] {text[:300]}")
+    if text:
+        print(f"[RX] {text[:400]}")
+    else:
+        # still return 200 so Telegram doesn't retry aggressively
+        return {"status": "ignored", "reason": "no text/caption"}
 
     symbol = parse_symbol(text)
     if not symbol:
@@ -275,7 +292,7 @@ async def telegram_webhook(request: Request):
 
 
 # =========================
-# SCHEDULER (Failsafe 1:55pm MT)
+# SCHEDULER (Failsafe)
 # =========================
 scheduler = BackgroundScheduler(timezone=MT)
 
@@ -286,7 +303,7 @@ if ENABLE_FLATTEN_FAILSAFE:
         id="flatten_failsafe",
         replace_existing=True,
     )
-    print(f"[SCHEDULER] Failsafe flatten ENABLED at {FLATTEN_HOUR:02d}:{FLATTEN_MINUTE:02d} MT (Mon–Fri)")
+    print(f"[SCHEDULER] Failsafe flatten ENABLED at {FLATTEN_HOUR:02d}:{FLATTEN_MINUTE:02d} {MT.key} (Mon–Fri)")
 else:
     print("[SCHEDULER] Failsafe flatten DISABLED")
 
