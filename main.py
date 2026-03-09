@@ -26,6 +26,28 @@ def env_bool(name: str, default: str = "false") -> bool:
     return os.getenv(name, default).strip().lower() in ("1", "true", "yes", "y", "on")
 
 
+def parse_hhmm(s: str, fallback: str) -> dtime:
+    raw = (s or "").strip()
+    if ":" not in raw:
+        print(f"[CONFIG][WARN] Invalid time '{raw}', using fallback {fallback}")
+        raw = fallback
+
+    parts = raw.split(":")
+    if len(parts) != 2:
+        print(f"[CONFIG][WARN] Invalid time '{raw}', using fallback {fallback}")
+        raw = fallback
+        parts = raw.split(":")
+
+    hh, mm = parts
+
+    try:
+        return dtime(int(hh), int(mm))
+    except Exception:
+        print(f"[CONFIG][WARN] Invalid time '{raw}', using fallback {fallback}")
+        fh, fm = fallback.split(":")
+        return dtime(int(fh), int(fm))
+
+
 API_ID = int(os.getenv("API_ID", "0") or "0")
 API_HASH = os.getenv("API_HASH", "").strip()
 SESSION_STRING = os.getenv("SESSION_STRING", "").strip()
@@ -63,7 +85,7 @@ ENABLE_DAY_MULTIPLIER = env_bool("ENABLE_DAY_MULTIPLIER", "true")
 DEFAULT_POSITION_SIZE = float(os.getenv("DEFAULT_POSITION_SIZE", "25"))
 MAX_POSITION_SIZE = float(os.getenv("MAX_POSITION_SIZE", "100"))
 
-# Optional persistent state
+# Persistent state
 PERSIST_STATE = env_bool("PERSIST_STATE", "false")
 STATE_FILE = os.getenv("STATE_FILE", "/data/trading_state.json").strip()
 
@@ -130,7 +152,6 @@ def get_position_size() -> float:
     weekday = now.weekday()
     now_time = now.time()
 
-    # If both are disabled, use default
     if not ENABLE_TIMEFRAME_SIZING and not ENABLE_DAY_MULTIPLIER:
         return min(DEFAULT_POSITION_SIZE, MAX_POSITION_SIZE)
 
@@ -213,13 +234,8 @@ def _sync_open_positions_from_disk() -> None:
 # ============================================================
 # HELPERS
 # ============================================================
-def parse_hhmm(s: str) -> dtime:
-    hh, mm = s.strip().split(":")
-    return dtime(int(hh), int(mm))
-
-
-BUY_START_T = parse_hhmm(BUY_WINDOW_START)
-BUY_END_T = parse_hhmm(BUY_WINDOW_END)
+BUY_START_T = parse_hhmm(BUY_WINDOW_START, "12:00")
+BUY_END_T = parse_hhmm(BUY_WINDOW_END, "16:00")
 
 
 def in_time_window(now_t: dtime, start_t: dtime, end_t: dtime) -> bool:
@@ -279,8 +295,9 @@ def post_to_traderspost(symbol: str, action: str) -> Tuple[Optional[int], str]:
 
     if action == "buy":
         size = get_position_size()
-        payload["size"] = size
-        print(f"[POSITION SIZE] {size}%")
+        payload["quantity"] = size
+        payload["quantityType"] = "percent_of_equity"
+        print(f"[POSITION SIZE] {size}% of equity")
 
     data = json.dumps(payload).encode("utf-8")
     req = urlrequest.Request(
@@ -328,7 +345,6 @@ def decide_action(symbol: str) -> Tuple[Optional[str], Optional[str]]:
 
         next_count = current + 1
 
-        # BUY attempt on odd counts
         if next_count % 2 == 1:
             if buy_count_today >= MAX_BUYS_PER_DAY:
                 return None, "max_buys_reached"
@@ -342,10 +358,8 @@ def decide_action(symbol: str) -> Tuple[Optional[str], Optional[str]]:
             _save_state(open_positions)
 
             print(f"[BUY COUNT] {buy_count_today}/{MAX_BUYS_PER_DAY}")
-
             return "buy", None
 
-        # SELL attempt on even counts
         if symbol not in open_positions:
             return None, "no_open_position"
 
@@ -354,7 +368,6 @@ def decide_action(symbol: str) -> Tuple[Optional[str], Optional[str]]:
         _save_state(open_positions)
 
         print(f"[BUY COUNT] still {buy_count_today}/{MAX_BUYS_PER_DAY}")
-
         return "sell", None
 
 
@@ -442,7 +455,6 @@ async def telethon_main():
     print(f"[BOOT] Logged in as: {getattr(me, 'first_name', '')} (id={me.id})")
     print(f"[BOOT] Listening for messages from: {SOURCE_CHAT}")
 
-    # Load persistent state if enabled
     _sync_open_positions_from_disk()
 
     try:
