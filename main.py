@@ -27,68 +27,187 @@ def env_bool(name: str, default: str = "false") -> bool:
 
 
 API_ID = int(os.getenv("API_ID", "0") or "0")
-API_HASH = (os.getenv("API_HASH", "") or "").strip()
-SESSION_STRING = (os.getenv("SESSION_STRING", "") or "").strip()
+API_HASH = os.getenv("API_HASH", "").strip()
+SESSION_STRING = os.getenv("SESSION_STRING", "").strip()
 
-SOURCE_CHAT = (os.getenv("SOURCE_CHAT", "") or "").strip()  # e.g. @intellectia_1_bot_bot
-TRADERSPOST_WEBHOOK = (os.getenv("TRADERSPOST_WEBHOOK", "") or "").strip()
+SOURCE_CHAT = os.getenv("SOURCE_CHAT", "").strip()
+TRADERSPOST_WEBHOOK = os.getenv("TRADERSPOST_WEBHOOK", "").strip()
 
 MAX_BUYS_PER_DAY = int(os.getenv("MAX_BUYS_PER_DAY", "5"))
 
-# Buy window (ET by default)
 BUY_WINDOW_ENABLED = env_bool("BUY_WINDOW_ENABLED", "true")
 BUY_WINDOW_TZ = ZoneInfo(os.getenv("BUY_WINDOW_TZ", "America/New_York"))
-BUY_WINDOW_START = os.getenv("BUY_WINDOW_START", "12:00")  # HH:MM
-BUY_WINDOW_END = os.getenv("BUY_WINDOW_END", "16:00")      # HH:MM
+BUY_WINDOW_START = os.getenv("BUY_WINDOW_START", "12:00")
+BUY_WINDOW_END = os.getenv("BUY_WINDOW_END", "16:00")
 
-# Option B toggle (the new feature)
-DISQUALIFY_OUTSIDE_WINDOW_FIRST_SIGNAL = env_bool("DISQUALIFY_OUTSIDE_WINDOW_FIRST_SIGNAL", "false")
+DISQUALIFY_OUTSIDE_WINDOW_FIRST_SIGNAL = env_bool(
+    "DISQUALIFY_OUTSIDE_WINDOW_FIRST_SIGNAL", "false"
+)
 
-# Blacklist
 BLACKLIST_RAW = os.getenv("BLACKLIST", "")
 BLACKLIST = {s.strip().upper() for s in BLACKLIST_RAW.split(",") if s.strip()}
 
-# Failsafe flatten (Utah time)
 TZ_NAME = os.getenv("TZ_NAME", "America/Denver")
 MT = ZoneInfo(TZ_NAME)
+
 ENABLE_FLATTEN_FAILSAFE = env_bool("ENABLE_FLATTEN_FAILSAFE", "true")
 FLATTEN_HOUR = int(os.getenv("FLATTEN_HOUR", "13"))
 FLATTEN_MINUTE = int(os.getenv("FLATTEN_MINUTE", "55"))
 
-# TradersPost payload keys (normally ticker/action)
 TP_TICKER_KEY = os.getenv("TP_TICKER_KEY", "ticker")
 TP_ACTION_KEY = os.getenv("TP_ACTION_KEY", "action")
 
-# Intellectia format: "Symbol XYZ has a daytrading signal!"
+# Position sizing controls
+ENABLE_TIMEFRAME_SIZING = env_bool("ENABLE_TIMEFRAME_SIZING", "true")
+ENABLE_DAY_MULTIPLIER = env_bool("ENABLE_DAY_MULTIPLIER", "true")
+DEFAULT_POSITION_SIZE = float(os.getenv("DEFAULT_POSITION_SIZE", "25"))
+MAX_POSITION_SIZE = float(os.getenv("MAX_POSITION_SIZE", "100"))
+
+# Optional persistent state
+PERSIST_STATE = env_bool("PERSIST_STATE", "false")
+STATE_FILE = os.getenv("STATE_FILE", "/data/trading_state.json").strip()
+
 SYMBOL_RE = re.compile(r"\bSymbol\s+([A-Z]{1,10})\b", re.IGNORECASE)
 
-# Basic required checks
 if not (API_ID and API_HASH and SESSION_STRING):
     raise RuntimeError("Missing API_ID / API_HASH / SESSION_STRING")
 if not SOURCE_CHAT:
-    raise RuntimeError("Missing SOURCE_CHAT (e.g. @intellectia_1_bot_bot)")
+    raise RuntimeError("Missing SOURCE_CHAT")
 if not TRADERSPOST_WEBHOOK:
     raise RuntimeError("Missing TRADERSPOST_WEBHOOK")
 
 
 # ============================================================
-# STATE (in-memory)
+# POSITION SIZING CONFIG
+# ============================================================
+WINDOW_SIZES = {
+    "09:30": float(os.getenv("WINDOW_0930", "30")),
+    "10:00": float(os.getenv("WINDOW_1000", "28")),
+    "10:30": float(os.getenv("WINDOW_1030", "26")),
+    "11:00": float(os.getenv("WINDOW_1100", "24")),
+    "11:30": float(os.getenv("WINDOW_1130", "22")),
+    "12:00": float(os.getenv("WINDOW_1200", "20")),
+    "12:30": float(os.getenv("WINDOW_1230", "18")),
+    "13:00": float(os.getenv("WINDOW_1300", "16")),
+    "13:30": float(os.getenv("WINDOW_1330", "14")),
+    "14:00": float(os.getenv("WINDOW_1400", "12")),
+}
+
+DAY_MULTIPLIERS = {
+    0: float(os.getenv("DAY_MON", "1.0")),
+    1: float(os.getenv("DAY_TUE", "1.0")),
+    2: float(os.getenv("DAY_WED", "1.0")),
+    3: float(os.getenv("DAY_THU", "1.0")),
+    4: float(os.getenv("DAY_FRI", "1.0")),
+}
+
+
+def get_window_size(now_time: dtime) -> float:
+    if dtime(9, 30) <= now_time < dtime(10, 0):
+        return WINDOW_SIZES["09:30"]
+    elif dtime(10, 0) <= now_time < dtime(10, 30):
+        return WINDOW_SIZES["10:00"]
+    elif dtime(10, 30) <= now_time < dtime(11, 0):
+        return WINDOW_SIZES["10:30"]
+    elif dtime(11, 0) <= now_time < dtime(11, 30):
+        return WINDOW_SIZES["11:00"]
+    elif dtime(11, 30) <= now_time < dtime(12, 0):
+        return WINDOW_SIZES["11:30"]
+    elif dtime(12, 0) <= now_time < dtime(12, 30):
+        return WINDOW_SIZES["12:00"]
+    elif dtime(12, 30) <= now_time < dtime(13, 0):
+        return WINDOW_SIZES["12:30"]
+    elif dtime(13, 0) <= now_time < dtime(13, 30):
+        return WINDOW_SIZES["13:00"]
+    elif dtime(13, 30) <= now_time < dtime(14, 0):
+        return WINDOW_SIZES["13:30"]
+    else:
+        return WINDOW_SIZES["14:00"]
+
+
+def get_position_size() -> float:
+    now = datetime.now(BUY_WINDOW_TZ)
+    weekday = now.weekday()
+    now_time = now.time()
+
+    # If both are disabled, use default
+    if not ENABLE_TIMEFRAME_SIZING and not ENABLE_DAY_MULTIPLIER:
+        return min(DEFAULT_POSITION_SIZE, MAX_POSITION_SIZE)
+
+    base_size = DEFAULT_POSITION_SIZE
+    if ENABLE_TIMEFRAME_SIZING:
+        base_size = get_window_size(now_time)
+
+    multiplier = 1.0
+    if ENABLE_DAY_MULTIPLIER:
+        multiplier = DAY_MULTIPLIERS.get(weekday, 1.0)
+
+    size = round(base_size * multiplier, 2)
+    return min(size, MAX_POSITION_SIZE)
+
+
+# ============================================================
+# STATE
 # ============================================================
 lock = threading.Lock()
 
-today_date_mt = None  # MT date
-signal_count_by_symbol = {}  # per-day per-symbol counter (for BUY/SELL toggling)
+today_date_mt = None
+signal_count_by_symbol = {}
 buy_count_today = 0
-open_positions = set()       # best-effort: track symbols we bought
+open_positions = set()
 
-# Option B state
-disqualified_symbols = set()  # symbols ignored for the rest of the day
+disqualified_symbols = set()
 
-# Debug state
 last_event = None
 last_error = None
 connected = False
 resolved_source = None
+
+
+# ============================================================
+# PERSISTENCE
+# ============================================================
+def _load_state() -> dict:
+    if not PERSIST_STATE:
+        return {"open_positions": []}
+
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {"open_positions": []}
+    except FileNotFoundError:
+        return {"open_positions": []}
+    except Exception as e:
+        print(f"[STATE][ERROR] load failed: {e}")
+        return {"open_positions": []}
+
+
+def _save_state(open_positions_set: set) -> None:
+    if not PERSIST_STATE:
+        return
+
+    try:
+        folder = os.path.dirname(STATE_FILE) or "."
+        os.makedirs(folder, exist_ok=True)
+
+        tmp = STATE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"open_positions": sorted(list(open_positions_set))}, f)
+        os.replace(tmp, STATE_FILE)
+
+        print(f"[STATE] Saved open_positions ({len(open_positions_set)}): {sorted(list(open_positions_set))}")
+    except Exception as e:
+        print(f"[STATE][ERROR] save failed: {e}")
+
+
+def _sync_open_positions_from_disk() -> None:
+    global open_positions
+    st = _load_state()
+    raw = st.get("open_positions", [])
+    if not isinstance(raw, list):
+        raw = []
+    open_positions = {str(s).upper() for s in raw if str(s).strip()}
+    print(f"[STATE] Loaded open_positions from disk ({len(open_positions)}): {sorted(list(open_positions))}")
 
 
 # ============================================================
@@ -104,7 +223,6 @@ BUY_END_T = parse_hhmm(BUY_WINDOW_END)
 
 
 def in_time_window(now_t: dtime, start_t: dtime, end_t: dtime) -> bool:
-    """True if now_t in [start_t, end_t). Supports windows crossing midnight."""
     if start_t == end_t:
         return True
     if start_t < end_t:
@@ -121,7 +239,7 @@ def buy_window_open_now() -> bool:
 
 
 def reset_if_new_day() -> None:
-    global today_date_mt, signal_count_by_symbol, buy_count_today, open_positions, disqualified_symbols
+    global today_date_mt, signal_count_by_symbol, buy_count_today, disqualified_symbols
 
     d = datetime.now(MT).date()
     with lock:
@@ -129,14 +247,17 @@ def reset_if_new_day() -> None:
             today_date_mt = d
             signal_count_by_symbol = {}
             buy_count_today = 0
-            open_positions = set()
             disqualified_symbols = set()
 
             print("=================================")
             print(f"[RESET] New trading day ({TZ_NAME}): {today_date_mt}")
-            print(f"[BUY COUNT] {buy_count_today} / {MAX_BUYS_PER_DAY}")
+            print(f"[BUY COUNT] {buy_count_today}/{MAX_BUYS_PER_DAY}")
             print(f"[BUY WINDOW] enabled={BUY_WINDOW_ENABLED} tz={BUY_WINDOW_TZ.key} {BUY_WINDOW_START}->{BUY_WINDOW_END}")
             print(f"[DISQUALIFY_OUTSIDE_WINDOW_FIRST_SIGNAL] {DISQUALIFY_OUTSIDE_WINDOW_FIRST_SIGNAL}")
+            print(f"[ENABLE_TIMEFRAME_SIZING] {ENABLE_TIMEFRAME_SIZING}")
+            print(f"[ENABLE_DAY_MULTIPLIER] {ENABLE_DAY_MULTIPLIER}")
+            print(f"[DEFAULT_POSITION_SIZE] {DEFAULT_POSITION_SIZE}")
+            print(f"[MAX_POSITION_SIZE] {MAX_POSITION_SIZE}")
             if BLACKLIST:
                 print(f"[BLACKLIST] {sorted(BLACKLIST)}")
             print("=================================")
@@ -147,8 +268,20 @@ def parse_symbol(text: str) -> Optional[str]:
     return m.group(1).upper() if m else None
 
 
+# ============================================================
+# WEBHOOK
+# ============================================================
 def post_to_traderspost(symbol: str, action: str) -> Tuple[Optional[int], str]:
-    payload = {TP_TICKER_KEY: symbol, TP_ACTION_KEY: action}
+    payload = {
+        TP_TICKER_KEY: symbol,
+        TP_ACTION_KEY: action,
+    }
+
+    if action == "buy":
+        size = get_position_size()
+        payload["size"] = size
+        print(f"[POSITION SIZE] {size}%")
+
     data = json.dumps(payload).encode("utf-8")
     req = urlrequest.Request(
         TRADERSPOST_WEBHOOK,
@@ -172,14 +305,10 @@ def post_to_traderspost(symbol: str, action: str) -> Tuple[Optional[int], str]:
         return None, msg
 
 
+# ============================================================
+# SIGNAL LOGIC
+# ============================================================
 def decide_action(symbol: str) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Logic:
-      - Ignore blacklist always
-      - Option B: If first sighting of symbol is outside buy window -> disqualify symbol all day
-      - Odd count = BUY attempt (subject to window + max buys/day)
-      - Even count = SELL attempt (only if we tracked open)
-    """
     global buy_count_today
 
     reset_if_new_day()
@@ -188,13 +317,11 @@ def decide_action(symbol: str) -> Tuple[Optional[str], Optional[str]]:
         return None, "blacklisted"
 
     with lock:
-        # Option B guard (new)
         if DISQUALIFY_OUTSIDE_WINDOW_FIRST_SIGNAL and symbol in disqualified_symbols:
             return None, "disqualified_for_day"
 
         current = signal_count_by_symbol.get(symbol, 0)
 
-        # Option B: first ever message for this symbol arrives outside buy window → disqualify for day
         if DISQUALIFY_OUTSIDE_WINDOW_FIRST_SIGNAL and current == 0 and not buy_window_open_now():
             disqualified_symbols.add(symbol)
             return None, "first_signal_outside_buy_window"
@@ -209,41 +336,57 @@ def decide_action(symbol: str) -> Tuple[Optional[str], Optional[str]]:
             if not buy_window_open_now():
                 return None, "outside_buy_window"
 
-            # commit BUY
             signal_count_by_symbol[symbol] = next_count
             buy_count_today += 1
             open_positions.add(symbol)
+            _save_state(open_positions)
+
+            print(f"[BUY COUNT] {buy_count_today}/{MAX_BUYS_PER_DAY}")
+
             return "buy", None
 
         # SELL attempt on even counts
         if symbol not in open_positions:
             return None, "no_open_position"
 
-        # commit SELL
         signal_count_by_symbol[symbol] = next_count
         open_positions.discard(symbol)
+        _save_state(open_positions)
+
+        print(f"[BUY COUNT] still {buy_count_today}/{MAX_BUYS_PER_DAY}")
+
         return "sell", None
 
 
+# ============================================================
+# FAILSAFE
+# ============================================================
 def flatten_all_open_positions() -> None:
     reset_if_new_day()
+
     with lock:
         symbols = sorted(open_positions)
 
+    print(f"[FAILSAFE] Trigger @ {datetime.now(MT).isoformat()} open_positions={symbols}")
+
     if not symbols:
-        print(f"[FAILSAFE] Flatten @ {datetime.now(MT).isoformat()} — nothing open.")
+        print("[FAILSAFE] nothing open")
         return
 
-    print(f"[FAILSAFE] Flatten @ {datetime.now(MT).isoformat()} — closing: {symbols}")
+    print(f"[FAILSAFE] closing {symbols}")
+
     for sym in symbols:
         post_to_traderspost(sym, "sell")
 
     with lock:
         open_positions.clear()
+    _save_state(open_positions)
+
+    print("[FAILSAFE] Flatten complete; state cleared and saved.")
 
 
 # ============================================================
-# FastAPI endpoints
+# FASTAPI
 # ============================================================
 app = FastAPI()
 
@@ -251,27 +394,14 @@ app = FastAPI()
 @app.get("/health")
 def health():
     reset_if_new_day()
-    with lock:
-        return {
-            "ok": True,
-            "connected": connected,
-            "resolved_source": resolved_source,
-            "date_mt": str(today_date_mt),
-            "buy_count_today": buy_count_today,
-            "max_buys_per_day": MAX_BUYS_PER_DAY,
-            "open_positions": sorted(list(open_positions)),
-            "disqualified_symbols": sorted(list(disqualified_symbols)),
-            "blacklist": sorted(list(BLACKLIST)),
-            "buy_window": {
-                "enabled": BUY_WINDOW_ENABLED,
-                "tz": BUY_WINDOW_TZ.key,
-                "start": BUY_WINDOW_START,
-                "end": BUY_WINDOW_END,
-            },
-            "disqualify_outside_window_first_signal": DISQUALIFY_OUTSIDE_WINDOW_FIRST_SIGNAL,
-            "last_event": last_event,
-            "last_error": last_error,
-        }
+    return {
+        "buy_count_today": buy_count_today,
+        "open_positions": list(open_positions),
+        "timeframe_sizing_enabled": ENABLE_TIMEFRAME_SIZING,
+        "day_multiplier_enabled": ENABLE_DAY_MULTIPLIER,
+        "default_position_size": DEFAULT_POSITION_SIZE,
+        "max_position_size": MAX_POSITION_SIZE,
+    }
 
 
 @app.post("/flatten-now")
@@ -281,24 +411,21 @@ def flatten_now():
 
 
 # ============================================================
-# Scheduler
+# SCHEDULER
 # ============================================================
 scheduler = BackgroundScheduler(timezone=MT)
+
 if ENABLE_FLATTEN_FAILSAFE:
     scheduler.add_job(
         flatten_all_open_positions,
         CronTrigger(day_of_week="mon-fri", hour=FLATTEN_HOUR, minute=FLATTEN_MINUTE),
-        id="flatten_failsafe",
-        replace_existing=True,
     )
-    print(f"[SCHEDULER] Failsafe flatten ENABLED at {FLATTEN_HOUR:02d}:{FLATTEN_MINUTE:02d} MT (Mon–Fri)")
-else:
-    print("[SCHEDULER] Failsafe flatten DISABLED")
+
 scheduler.start()
 
 
 # ============================================================
-# Telethon listener
+# TELEGRAM LISTENER
 # ============================================================
 client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 
@@ -306,12 +433,17 @@ client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 async def telethon_main():
     global connected, resolved_source, last_error, last_event
 
-    print("[BOOT] Starting Telethon listener…")
+    print("[BOOT] starting listener")
+
     await client.start()
     me = await client.get_me()
     connected = True
+
     print(f"[BOOT] Logged in as: {getattr(me, 'first_name', '')} (id={me.id})")
     print(f"[BOOT] Listening for messages from: {SOURCE_CHAT}")
+
+    # Load persistent state if enabled
+    _sync_open_positions_from_disk()
 
     try:
         entity = await client.get_entity(SOURCE_CHAT)
@@ -324,7 +456,6 @@ async def telethon_main():
 
     @client.on(events.NewMessage(chats=entity))
     async def on_message(event):
-        nonlocal entity
         global last_event, last_error
 
         try:
@@ -334,11 +465,8 @@ async def telethon_main():
             if not text:
                 return
 
-            # Store a short version for /health
             last_event = text[:300]
-
-            # Print receive log
-            print(f"[RX] {text[:400]}")
+            print(f"[RX] {text}")
 
             symbol = parse_symbol(text)
             if not symbol:
@@ -365,12 +493,12 @@ async def telethon_main():
 
 
 @app.on_event("startup")
-async def on_startup():
+async def startup():
     asyncio.create_task(telethon_main())
 
 
 # ============================================================
-# Entrypoint
+# ENTRYPOINT
 # ============================================================
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8080"))
