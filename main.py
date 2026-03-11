@@ -85,6 +85,10 @@ ENABLE_DAY_MULTIPLIER = env_bool("ENABLE_DAY_MULTIPLIER", "true")
 DEFAULT_POSITION_SIZE = float(os.getenv("DEFAULT_POSITION_SIZE", "25"))
 MAX_POSITION_SIZE = float(os.getenv("MAX_POSITION_SIZE", "100"))
 
+# Signal-driven stop loss
+STOP_LOSS_ENABLED = env_bool("STOP_LOSS_ENABLED", "true")
+STOP_LOSS_PERCENT = float(os.getenv("STOP_LOSS_PERCENT", "2"))
+
 # Persistent state
 PERSIST_STATE = env_bool("PERSIST_STATE", "false")
 STATE_FILE = os.getenv("STATE_FILE", "/data/trading_state.json").strip()
@@ -274,6 +278,8 @@ def reset_if_new_day() -> None:
             print(f"[ENABLE_DAY_MULTIPLIER] {ENABLE_DAY_MULTIPLIER}")
             print(f"[DEFAULT_POSITION_SIZE] {DEFAULT_POSITION_SIZE}")
             print(f"[MAX_POSITION_SIZE] {MAX_POSITION_SIZE}")
+            print(f"[STOP_LOSS_ENABLED] {STOP_LOSS_ENABLED}")
+            print(f"[STOP_LOSS_PERCENT] {STOP_LOSS_PERCENT}")
             if BLACKLIST:
                 print(f"[BLACKLIST] {sorted(BLACKLIST)}")
             print("=================================")
@@ -298,6 +304,15 @@ def post_to_traderspost(symbol: str, action: str) -> Tuple[Optional[int], str]:
         payload["quantity"] = size
         payload["quantityType"] = "percent_of_equity"
         print(f"[POSITION SIZE] {size}% of equity")
+
+        if STOP_LOSS_ENABLED:
+            payload["stopLoss"] = {
+                "type": "stop",
+                "percent": STOP_LOSS_PERCENT,
+            }
+            print(f"[STOP LOSS] {STOP_LOSS_PERCENT}%")
+
+    print(f"[WEBHOOK PAYLOAD] {payload}")
 
     data = json.dumps(payload).encode("utf-8")
     req = urlrequest.Request(
@@ -414,6 +429,8 @@ def health():
         "day_multiplier_enabled": ENABLE_DAY_MULTIPLIER,
         "default_position_size": DEFAULT_POSITION_SIZE,
         "max_position_size": MAX_POSITION_SIZE,
+        "stop_loss_enabled": STOP_LOSS_ENABLED,
+        "stop_loss_percent": STOP_LOSS_PERCENT,
     }
 
 
