@@ -220,7 +220,10 @@ def _save_state(open_positions_set: set) -> None:
             json.dump({"open_positions": sorted(list(open_positions_set))}, f)
         os.replace(tmp, STATE_FILE)
 
-        print(f"[STATE] Saved open_positions ({len(open_positions_set)}): {sorted(list(open_positions_set))}")
+        print(
+            f"[STATE] Saved open_positions ({len(open_positions_set)}): "
+            f"{sorted(list(open_positions_set))}"
+        )
     except Exception as e:
         print(f"[STATE][ERROR] save failed: {e}")
 
@@ -232,7 +235,10 @@ def _sync_open_positions_from_disk() -> None:
     if not isinstance(raw, list):
         raw = []
     open_positions = {str(s).upper() for s in raw if str(s).strip()}
-    print(f"[STATE] Loaded open_positions from disk ({len(open_positions)}): {sorted(list(open_positions))}")
+    print(
+        f"[STATE] Loaded open_positions from disk ({len(open_positions)}): "
+        f"{sorted(list(open_positions))}"
+    )
 
 
 # ============================================================
@@ -272,14 +278,24 @@ def reset_if_new_day() -> None:
             print("=================================")
             print(f"[RESET] New trading day ({TZ_NAME}): {today_date_mt}")
             print(f"[BUY COUNT] {buy_count_today}/{MAX_BUYS_PER_DAY}")
-            print(f"[BUY WINDOW] enabled={BUY_WINDOW_ENABLED} tz={BUY_WINDOW_TZ.key} {BUY_WINDOW_START}->{BUY_WINDOW_END}")
-            print(f"[DISQUALIFY_OUTSIDE_WINDOW_FIRST_SIGNAL] {DISQUALIFY_OUTSIDE_WINDOW_FIRST_SIGNAL}")
+            print(
+                f"[BUY WINDOW] enabled={BUY_WINDOW_ENABLED} "
+                f"tz={BUY_WINDOW_TZ.key} {BUY_WINDOW_START}->{BUY_WINDOW_END}"
+            )
+            print(
+                f"[DISQUALIFY_OUTSIDE_WINDOW_FIRST_SIGNAL] "
+                f"{DISQUALIFY_OUTSIDE_WINDOW_FIRST_SIGNAL}"
+            )
             print(f"[ENABLE_TIMEFRAME_SIZING] {ENABLE_TIMEFRAME_SIZING}")
             print(f"[ENABLE_DAY_MULTIPLIER] {ENABLE_DAY_MULTIPLIER}")
             print(f"[DEFAULT_POSITION_SIZE] {DEFAULT_POSITION_SIZE}")
             print(f"[MAX_POSITION_SIZE] {MAX_POSITION_SIZE}")
             print(f"[STOP_LOSS_ENABLED] {STOP_LOSS_ENABLED}")
             print(f"[STOP_LOSS_PERCENT] {STOP_LOSS_PERCENT}")
+            print(
+                f"[FAILSAFE CONFIG] enabled={ENABLE_FLATTEN_FAILSAFE} "
+                f"timezone={TZ_NAME} flatten={FLATTEN_HOUR:02d}:{FLATTEN_MINUTE:02d}"
+            )
             if BLACKLIST:
                 print(f"[BLACKLIST] {sorted(BLACKLIST)}")
             print("=================================")
@@ -431,6 +447,10 @@ def health():
         "max_position_size": MAX_POSITION_SIZE,
         "stop_loss_enabled": STOP_LOSS_ENABLED,
         "stop_loss_percent": STOP_LOSS_PERCENT,
+        "failsafe_enabled": ENABLE_FLATTEN_FAILSAFE,
+        "failsafe_timezone": TZ_NAME,
+        "failsafe_hour": FLATTEN_HOUR,
+        "failsafe_minute": FLATTEN_MINUTE,
     }
 
 
@@ -449,7 +469,14 @@ if ENABLE_FLATTEN_FAILSAFE:
     scheduler.add_job(
         flatten_all_open_positions,
         CronTrigger(day_of_week="mon-fri", hour=FLATTEN_HOUR, minute=FLATTEN_MINUTE),
+        id="flatten_failsafe",
+        replace_existing=True,
     )
+
+print(
+    f"[FAILSAFE CONFIG] enabled={ENABLE_FLATTEN_FAILSAFE} "
+    f"timezone={TZ_NAME} flatten={FLATTEN_HOUR:02d}:{FLATTEN_MINUTE:02d}"
+)
 
 scheduler.start()
 
@@ -476,7 +503,10 @@ async def telethon_main():
 
     try:
         entity = await client.get_entity(SOURCE_CHAT)
-        resolved_source = f"id={getattr(entity, 'id', None)} name={getattr(entity, 'title', None) or getattr(entity, 'username', None) or SOURCE_CHAT}"
+        resolved_source = (
+            f"id={getattr(entity, 'id', None)} "
+            f"name={getattr(entity, 'title', None) or getattr(entity, 'username', None) or SOURCE_CHAT}"
+        )
         print(f"[RESOLVE] SOURCE_CHAT resolved: {resolved_source}")
     except Exception as e:
         last_error = f"resolve_failed: {e}"
@@ -506,7 +536,11 @@ async def telethon_main():
             if action is None:
                 if reason in ("outside_buy_window", "first_signal_outside_buy_window"):
                     now_et = datetime.now(BUY_WINDOW_TZ).strftime("%H:%M")
-                    print(f"[WINDOW] Outside buy window ({BUY_WINDOW_START}-{BUY_WINDOW_END} {BUY_WINDOW_TZ.key}). Now={now_et}. BLOCK {symbol} ({reason})")
+                    print(
+                        f"[WINDOW] Outside buy window "
+                        f"({BUY_WINDOW_START}-{BUY_WINDOW_END} {BUY_WINDOW_TZ.key}). "
+                        f"Now={now_et}. BLOCK {symbol} ({reason})"
+                    )
                 else:
                     print(f"[BLOCKED] {symbol} reason={reason}")
                 return
