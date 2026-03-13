@@ -3,13 +3,15 @@ import re
 import json
 import asyncio
 import threading
+import subprocess
 from datetime import datetime, time as dtime
 from typing import Optional, Tuple
 from zoneinfo import ZoneInfo
 from urllib import request as urlrequest
 from urllib.error import URLError, HTTPError
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
 import uvicorn
 
 from telethon import TelegramClient, events
@@ -86,7 +88,7 @@ DEFAULT_POSITION_SIZE = float(os.getenv("DEFAULT_POSITION_SIZE", "25"))
 MAX_POSITION_SIZE = float(os.getenv("MAX_POSITION_SIZE", "100"))
 
 # Signal-driven stop loss
-STOP_LOSS_ENABLED = env_bool("STOP_LOSS_ENABLED", "true")
+STOP_LOSS_ENABLED = env_bool("STOP_LOSS_ENABLED", "false")
 STOP_LOSS_PERCENT = float(os.getenv("STOP_LOSS_PERCENT", "2"))
 
 # Persistent state
@@ -95,9 +97,12 @@ STATE_FILE = os.getenv("STATE_FILE", "/data/trading_state.json").strip()
 
 # Signal logging / backfill
 ENABLE_SIGNAL_LOGGING = env_bool("ENABLE_SIGNAL_LOGGING", "true")
-SIGNAL_LOG_FILE = os.getenv("SIGNAL_LOG_FILE", "/data/intellectia_signal_log.jsonl").strip()
+SIGNAL_LOG_DIR = os.getenv("SIGNAL_LOG_DIR", "/data/signals").strip()
 ENABLE_HISTORY_BACKFILL = env_bool("ENABLE_HISTORY_BACKFILL", "false")
-BACKFILL_LIMIT = int(os.getenv("BACKFILL_LIMIT", "500"))
+BACKFILL_LIMIT = int(os.getenv("BACKFILL_LIMIT", "10000"))
+
+# Excel export
+SIGNAL_XLSX_FILE = os.getenv("SIGNAL_XLSX_FILE", "/data/intellectia_signal_history.xlsx").strip()
 
 SYMBOL_RE = re.compile(r"\bSymbol\s+([A-Z]{1,10})\b", re.IGNORECASE)
 
@@ -201,6 +206,15 @@ resolved_source = None
 def _ensure_parent_dir(path: str) -> None:
     folder = os.path.dirname(path) or "."
     os.makedirs(folder, exist_ok=True)
+
+
+def signal_log_path_for_date(dt: datetime) -> str:
+    day_str = dt.astimezone(MT).date().isoformat()
+    return os.path.join(SIGNAL_LOG_DIR, f"{day_str}.jsonl")
+
+
+def today_signal_log_path() -> str:
+    return signal_log_path_for_date(datetime.now(MT))
 
 
 def append_jsonl(path: str, row: dict) -> None:
@@ -320,9 +334,10 @@ def reset_if_new_day() -> None:
                 f"timezone={TZ_NAME} flatten={FLATTEN_HOUR:02d}:{FLATTEN_MINUTE:02d}"
             )
             print(f"[ENABLE_SIGNAL_LOGGING] {ENABLE_SIGNAL_LOGGING}")
-            print(f"[SIGNAL_LOG_FILE] {SIGNAL_LOG_FILE}")
+            print(f"[SIGNAL_LOG_DIR] {SIGNAL_LOG_DIR}")
             print(f"[ENABLE_HISTORY_BACKFILL] {ENABLE_HISTORY_BACKFILL}")
             print(f"[BACKFILL_LIMIT] {BACKFILL_LIMIT}")
+            print(f"[SIGNAL_XLSX_FILE] {SIGNAL_XLSX_FILE}")
             if BLACKLIST:
                 print(f"[BLACKLIST] {sorted(BLACKLIST)}")
             print("=================================")
@@ -479,9 +494,11 @@ def health():
         "failsafe_hour": FLATTEN_HOUR,
         "failsafe_minute": FLATTEN_MINUTE,
         "signal_logging_enabled": ENABLE_SIGNAL_LOGGING,
-        "signal_log_file": SIGNAL_LOG_FILE,
+        "signal_log_dir": SIGNAL_LOG_DIR,
         "history_backfill_enabled": ENABLE_HISTORY_BACKFILL,
         "backfill_limit": BACKFILL_LIMIT,
+        "today_log_file": today_signal_log_path() if ENABLE_SIGNAL_LOGGING else None,
+        "signal_xlsx_file": SIGNAL_XLSX_FILE,
     }
 
 
@@ -489,6 +506,42 @@ def health():
 def flatten_now():
     flatten_all_open_positions()
     return {"ok": True}
+
+
+@app.get("/download-signals")
+def download_signals():
+    try:
+        result = subprocess.run(
+            ["python", "export_signals_to_excel.py"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        print(f"[EXPORT] stdout: {result.stdout.strip()}")
+        if result.stderr.strip():
+            print(f"[EXPORT] stderr: {result.stderr.strip()}")
+
+        if result.returncode != 0:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Excel export failed with code {result.returncode}"
+            )
+
+        if not os.path.exists(SIGNAL_XLSX_FILE):
+            raise HTTPException(
+                status_code=404,
+                detail=f"Excel file not found: {SIGNAL_XLSX_FILE}"
+            )
+
+        return FileResponse(
+            SIGNAL_XLSX_FILE,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            filename="intellectia_signal_history.xlsx",
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ============================================================
@@ -527,7 +580,6 @@ async def maybe_backfill_history(entity) -> None:
     count = 0
     async for msg in client.iter_messages(entity, limit=BACKFILL_LIMIT):
         try:
-            # Only log received/incoming messages, never your own sent/forwarded tests
             if getattr(msg, "out", False):
                 continue
 
@@ -535,12 +587,13 @@ async def maybe_backfill_history(entity) -> None:
             if not text:
                 continue
 
+            msg_dt = msg.date
             symbol = parse_symbol(text)
 
             row = {
                 "kind": "history_message",
                 "message_id": msg.id,
-                "telegram_ts": msg.date.isoformat() if msg.date else None,
+                "telegram_ts": msg_dt.isoformat() if msg_dt else None,
                 "logged_ts": datetime.now(MT).isoformat(),
                 "source_chat": SOURCE_CHAT,
                 "incoming": True,
@@ -548,8 +601,11 @@ async def maybe_backfill_history(entity) -> None:
                 "symbol": symbol,
                 "raw_text": text,
             }
-            append_jsonl(SIGNAL_LOG_FILE, row)
-            count += 1
+
+            if msg_dt is not None:
+                path = signal_log_path_for_date(msg_dt)
+                append_jsonl(path, row)
+                count += 1
         except Exception as e:
             print(f"[BACKFILL][ERROR] {e}")
 
@@ -589,7 +645,6 @@ async def telethon_main():
         global last_event, last_error
 
         try:
-            # Ignore your own sent/forwarded test messages
             if getattr(event, "out", False) or getattr(event.message, "out", False):
                 print("[LOG] Skipping outgoing/self-sent message")
                 return
@@ -625,6 +680,7 @@ async def telethon_main():
                     print(f"[BLOCKED] {symbol} reason={reason}")
 
             if ENABLE_SIGNAL_LOGGING:
+                path = today_signal_log_path()
                 row = {
                     "kind": "live_message",
                     "message_id": getattr(event.message, "id", None),
@@ -643,7 +699,8 @@ async def telethon_main():
                     "webhook_status": webhook_status,
                     "webhook_body": webhook_body[:500] if isinstance(webhook_body, str) else webhook_body,
                 }
-                append_jsonl(SIGNAL_LOG_FILE, row)
+                append_jsonl(path, row)
+                print(f"[LOG] Appended signal row -> {path}")
 
         except Exception as e:
             last_error = str(e)
