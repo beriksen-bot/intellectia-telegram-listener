@@ -93,6 +93,12 @@ STOP_LOSS_PERCENT = float(os.getenv("STOP_LOSS_PERCENT", "2"))
 PERSIST_STATE = env_bool("PERSIST_STATE", "false")
 STATE_FILE = os.getenv("STATE_FILE", "/data/trading_state.json").strip()
 
+# Signal logging / backfill
+ENABLE_SIGNAL_LOGGING = env_bool("ENABLE_SIGNAL_LOGGING", "true")
+SIGNAL_LOG_FILE = os.getenv("SIGNAL_LOG_FILE", "/data/intellectia_signal_log.jsonl").strip()
+ENABLE_HISTORY_BACKFILL = env_bool("ENABLE_HISTORY_BACKFILL", "false")
+BACKFILL_LIMIT = int(os.getenv("BACKFILL_LIMIT", "500"))
+
 SYMBOL_RE = re.compile(r"\bSymbol\s+([A-Z]{1,10})\b", re.IGNORECASE)
 
 if not (API_ID and API_HASH and SESSION_STRING):
@@ -187,6 +193,23 @@ last_event = None
 last_error = None
 connected = False
 resolved_source = None
+
+
+# ============================================================
+# FILE HELPERS
+# ============================================================
+def _ensure_parent_dir(path: str) -> None:
+    folder = os.path.dirname(path) or "."
+    os.makedirs(folder, exist_ok=True)
+
+
+def append_jsonl(path: str, row: dict) -> None:
+    try:
+        _ensure_parent_dir(path)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except Exception as e:
+        print(f"[LOG][ERROR] Could not append to {path}: {e}")
 
 
 # ============================================================
@@ -296,6 +319,10 @@ def reset_if_new_day() -> None:
                 f"[FAILSAFE CONFIG] enabled={ENABLE_FLATTEN_FAILSAFE} "
                 f"timezone={TZ_NAME} flatten={FLATTEN_HOUR:02d}:{FLATTEN_MINUTE:02d}"
             )
+            print(f"[ENABLE_SIGNAL_LOGGING] {ENABLE_SIGNAL_LOGGING}")
+            print(f"[SIGNAL_LOG_FILE] {SIGNAL_LOG_FILE}")
+            print(f"[ENABLE_HISTORY_BACKFILL] {ENABLE_HISTORY_BACKFILL}")
+            print(f"[BACKFILL_LIMIT] {BACKFILL_LIMIT}")
             if BLACKLIST:
                 print(f"[BLACKLIST] {sorted(BLACKLIST)}")
             print("=================================")
@@ -309,7 +336,7 @@ def parse_symbol(text: str) -> Optional[str]:
 # ============================================================
 # WEBHOOK
 # ============================================================
-def post_to_traderspost(symbol: str, action: str) -> Tuple[Optional[int], str]:
+def post_to_traderspost(symbol: str, action: str) -> Tuple[Optional[int], str, dict]:
     payload = {
         TP_TICKER_KEY: symbol,
         TP_ACTION_KEY: action,
@@ -342,15 +369,15 @@ def post_to_traderspost(symbol: str, action: str) -> Tuple[Optional[int], str]:
         with urlrequest.urlopen(req, timeout=20) as resp:
             body = resp.read().decode("utf-8", errors="ignore")
             print(f"[TRADERSPOST] {action.upper()} {symbol} -> {resp.status} {body[:250]}")
-            return resp.status, body
+            return resp.status, body, payload
     except HTTPError as e:
         body = e.read().decode("utf-8", errors="ignore") if hasattr(e, "read") else str(e)
         print(f"[TRADERSPOST][HTTPError] {action.upper()} {symbol} -> {e.code} {body[:250]}")
-        return e.code, body
+        return e.code, body, payload
     except URLError as e:
         msg = str(e)
         print(f"[TRADERSPOST][URLError] {action.upper()} {symbol} -> {msg}")
-        return None, msg
+        return None, msg, payload
 
 
 # ============================================================
@@ -451,6 +478,10 @@ def health():
         "failsafe_timezone": TZ_NAME,
         "failsafe_hour": FLATTEN_HOUR,
         "failsafe_minute": FLATTEN_MINUTE,
+        "signal_logging_enabled": ENABLE_SIGNAL_LOGGING,
+        "signal_log_file": SIGNAL_LOG_FILE,
+        "history_backfill_enabled": ENABLE_HISTORY_BACKFILL,
+        "backfill_limit": BACKFILL_LIMIT,
     }
 
 
@@ -487,6 +518,44 @@ scheduler.start()
 client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 
 
+async def maybe_backfill_history(entity) -> None:
+    if not ENABLE_SIGNAL_LOGGING or not ENABLE_HISTORY_BACKFILL:
+        return
+
+    print(f"[BACKFILL] Starting history backfill (limit={BACKFILL_LIMIT})")
+
+    count = 0
+    async for msg in client.iter_messages(entity, limit=BACKFILL_LIMIT):
+        try:
+            # Only log received/incoming messages, never your own sent/forwarded tests
+            if getattr(msg, "out", False):
+                continue
+
+            text = (getattr(msg, "raw_text", "") or "").strip()
+            if not text:
+                continue
+
+            symbol = parse_symbol(text)
+
+            row = {
+                "kind": "history_message",
+                "message_id": msg.id,
+                "telegram_ts": msg.date.isoformat() if msg.date else None,
+                "logged_ts": datetime.now(MT).isoformat(),
+                "source_chat": SOURCE_CHAT,
+                "incoming": True,
+                "outgoing": False,
+                "symbol": symbol,
+                "raw_text": text,
+            }
+            append_jsonl(SIGNAL_LOG_FILE, row)
+            count += 1
+        except Exception as e:
+            print(f"[BACKFILL][ERROR] {e}")
+
+    print(f"[BACKFILL] Completed. Logged {count} received messages.")
+
+
 async def telethon_main():
     global connected, resolved_source, last_error, last_event
 
@@ -513,11 +582,18 @@ async def telethon_main():
         print(f"[ERROR] Could not resolve SOURCE_CHAT={SOURCE_CHAT}: {e}")
         raise
 
+    await maybe_backfill_history(entity)
+
     @client.on(events.NewMessage(chats=entity))
     async def on_message(event):
         global last_event, last_error
 
         try:
+            # Ignore your own sent/forwarded test messages
+            if getattr(event, "out", False) or getattr(event.message, "out", False):
+                print("[LOG] Skipping outgoing/self-sent message")
+                return
+
             reset_if_new_day()
 
             text = (event.raw_text or "").strip()
@@ -528,12 +604,16 @@ async def telethon_main():
             print(f"[RX] {text}")
 
             symbol = parse_symbol(text)
-            if not symbol:
-                return
+            action, reason = (None, "no_symbol") if not symbol else decide_action(symbol)
 
-            action, reason = decide_action(symbol)
+            webhook_status = None
+            webhook_body = None
+            webhook_payload = None
 
-            if action is None:
+            if symbol and action is not None:
+                print(f"[SIGNAL] {symbol} -> {action.upper()}")
+                webhook_status, webhook_body, webhook_payload = post_to_traderspost(symbol, action)
+            elif symbol:
                 if reason in ("outside_buy_window", "first_signal_outside_buy_window"):
                     now_et = datetime.now(BUY_WINDOW_TZ).strftime("%H:%M")
                     print(
@@ -543,10 +623,27 @@ async def telethon_main():
                     )
                 else:
                     print(f"[BLOCKED] {symbol} reason={reason}")
-                return
 
-            print(f"[SIGNAL] {symbol} -> {action.upper()}")
-            post_to_traderspost(symbol, action)
+            if ENABLE_SIGNAL_LOGGING:
+                row = {
+                    "kind": "live_message",
+                    "message_id": getattr(event.message, "id", None),
+                    "telegram_ts": event.message.date.isoformat() if getattr(event.message, "date", None) else None,
+                    "logged_ts": datetime.now(MT).isoformat(),
+                    "source_chat": SOURCE_CHAT,
+                    "incoming": True,
+                    "outgoing": False,
+                    "symbol": symbol,
+                    "raw_text": text,
+                    "decision": action,
+                    "reason": reason,
+                    "buy_count_today": buy_count_today,
+                    "open_positions": sorted(list(open_positions)),
+                    "webhook_payload": webhook_payload,
+                    "webhook_status": webhook_status,
+                    "webhook_body": webhook_body[:500] if isinstance(webhook_body, str) else webhook_body,
+                }
+                append_jsonl(SIGNAL_LOG_FILE, row)
 
         except Exception as e:
             last_error = str(e)
