@@ -2,6 +2,11 @@ import os
 import json
 import glob
 import pandas as pd
+from pandas.api.types import (
+    is_datetime64_any_dtype,
+    is_datetime64tz_dtype,
+    is_object_dtype,
+)
 
 
 SIGNAL_LOG_DIR = os.getenv("SIGNAL_LOG_DIR", "/data/signals").strip()
@@ -52,15 +57,41 @@ def discover_signal_files() -> list[str]:
     return unique
 
 
-def make_excel_safe_datetimes(df: pd.DataFrame) -> pd.DataFrame:
-    for col in ["telegram_ts", "logged_ts"]:
-        if col in df.columns:
-            df[col] = pd.to_datetime(df[col], errors="coerce")
+def strip_timezone_from_series(series: pd.Series) -> pd.Series:
+    # Already datetime with timezone
+    if is_datetime64tz_dtype(series):
+        return series.dt.tz_localize(None)
 
-            try:
-                df[col] = df[col].dt.tz_localize(None)
-            except Exception:
-                pass
+    # Naive datetime already fine
+    if is_datetime64_any_dtype(series):
+        return series
+
+    # For object columns, try parsing if they look datetime-like
+    if is_object_dtype(series):
+        parsed = pd.to_datetime(series, errors="coerce", utc=True)
+
+        # Only convert if at least one real datetime was found
+        if parsed.notna().any():
+            return parsed.dt.tz_localize(None)
+
+    return series
+
+
+def make_excel_safe(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+
+    for col in df.columns:
+        try:
+            df[col] = strip_timezone_from_series(df[col])
+        except Exception as e:
+            print(f"[WARN] Could not normalize column {col}: {e}")
+
+    # Final defensive pass: convert any remaining tz-aware python datetimes to strings
+    for col in df.columns:
+        if is_object_dtype(df[col]):
+            df[col] = df[col].map(
+                lambda x: x.isoformat() if hasattr(x, "tzinfo") and getattr(x, "tzinfo", None) is not None else x
+            )
 
     return df
 
@@ -70,7 +101,7 @@ def normalize_rows(rows: list[dict]) -> pd.DataFrame:
         return pd.DataFrame()
 
     df = pd.json_normalize(rows)
-    df = make_excel_safe_datetimes(df)
+    df = make_excel_safe(df)
 
     preferred_cols = [
         "kind",
@@ -100,6 +131,17 @@ def normalize_rows(rows: list[dict]) -> pd.DataFrame:
     return df
 
 
+def build_summary(df: pd.DataFrame) -> pd.DataFrame:
+    summary = {
+        "total_rows": [len(df)],
+        "unique_symbols": [df["symbol"].nunique() if "symbol" in df.columns else 0],
+        "date_min": [df["telegram_ts"].min() if "telegram_ts" in df.columns else None],
+        "date_max": [df["telegram_ts"].max() if "telegram_ts" in df.columns else None],
+    }
+    out = pd.DataFrame(summary)
+    return make_excel_safe(out)
+
+
 def main():
     files = discover_signal_files()
 
@@ -120,20 +162,14 @@ def main():
         raise SystemExit("No signal rows found to export")
 
     df = normalize_rows(all_rows)
+    summary_df = build_summary(df)
 
     out_dir = os.path.dirname(SIGNAL_XLSX_FILE) or "."
     os.makedirs(out_dir, exist_ok=True)
 
     with pd.ExcelWriter(SIGNAL_XLSX_FILE, engine="openpyxl") as writer:
         df.to_excel(writer, sheet_name="signals", index=False)
-
-        summary = {
-            "total_rows": [len(df)],
-            "unique_symbols": [df["symbol"].nunique() if "symbol" in df.columns else 0],
-            "date_min": [df["telegram_ts"].min() if "telegram_ts" in df.columns else None],
-            "date_max": [df["telegram_ts"].max() if "telegram_ts" in df.columns else None],
-        }
-        pd.DataFrame(summary).to_excel(writer, sheet_name="summary", index=False)
+        summary_df.to_excel(writer, sheet_name="summary", index=False)
 
     print(f"[EXPORT] Wrote Excel file: {SIGNAL_XLSX_FILE}")
 
