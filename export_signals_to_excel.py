@@ -9,7 +9,6 @@ SIGNAL_XLSX_FILE = os.getenv(
     "SIGNAL_XLSX_FILE", "/data/intellectia_signal_history.xlsx"
 ).strip()
 
-# Fallback legacy/single-file paths
 FALLBACK_FILES = [
     "/data/intellectia_signal_log.jsonl",
     "/data/signals.jsonl",
@@ -43,7 +42,6 @@ def discover_signal_files() -> list[str]:
         if os.path.exists(fallback):
             files.append(fallback)
 
-    # de-dupe while preserving order
     seen = set()
     unique = []
     for f in files:
@@ -54,11 +52,25 @@ def discover_signal_files() -> list[str]:
     return unique
 
 
+def make_excel_safe_datetimes(df: pd.DataFrame) -> pd.DataFrame:
+    for col in ["telegram_ts", "logged_ts"]:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors="coerce")
+
+            try:
+                df[col] = df[col].dt.tz_localize(None)
+            except Exception:
+                pass
+
+    return df
+
+
 def normalize_rows(rows: list[dict]) -> pd.DataFrame:
     if not rows:
         return pd.DataFrame()
 
     df = pd.json_normalize(rows)
+    df = make_excel_safe_datetimes(df)
 
     preferred_cols = [
         "kind",
@@ -81,10 +93,6 @@ def normalize_rows(rows: list[dict]) -> pd.DataFrame:
     remaining = [c for c in df.columns if c not in existing_preferred]
     df = df[existing_preferred + remaining]
 
-    for dt_col in ["telegram_ts", "logged_ts"]:
-        if dt_col in df.columns:
-            df[dt_col] = pd.to_datetime(df[dt_col], errors="coerce")
-
     sort_cols = [c for c in ["telegram_ts", "logged_ts", "message_id"] if c in df.columns]
     if sort_cols:
         df = df.sort_values(sort_cols, kind="stable")
@@ -102,7 +110,9 @@ def main():
 
     all_rows = []
     for path in files:
-        all_rows.extend(load_jsonl_file(path))
+        rows = load_jsonl_file(path)
+        print(f"[EXPORT] loaded {len(rows)} rows from {path}")
+        all_rows.extend(rows)
 
     print(f"[EXPORT] Loaded {len(all_rows)} total rows")
 
