@@ -3,7 +3,6 @@ import re
 import json
 import asyncio
 import threading
-import subprocess
 from datetime import datetime, time as dtime
 from typing import Optional, Tuple
 from zoneinfo import ZoneInfo
@@ -11,7 +10,6 @@ from urllib import request as urlrequest
 from urllib.error import URLError, HTTPError
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, JSONResponse
 import uvicorn
 
 from telethon import TelegramClient, events
@@ -58,6 +56,7 @@ SOURCE_CHAT = os.getenv("SOURCE_CHAT", "").strip()
 TRADERSPOST_WEBHOOK = os.getenv("TRADERSPOST_WEBHOOK", "").strip()
 
 MAX_BUYS_PER_DAY = int(os.getenv("MAX_BUYS_PER_DAY", "5"))
+MAX_BUYS_PER_WINDOW = int(os.getenv("MAX_BUYS_PER_WINDOW", "1"))
 
 BUY_WINDOW_ENABLED = env_bool("BUY_WINDOW_ENABLED", "true")
 BUY_WINDOW_TZ = ZoneInfo(os.getenv("BUY_WINDOW_TZ", "America/New_York"))
@@ -100,13 +99,6 @@ ENABLE_SIGNAL_LOGGING = env_bool("ENABLE_SIGNAL_LOGGING", "true")
 SIGNAL_LOG_DIR = os.getenv("SIGNAL_LOG_DIR", "/data/signals").strip()
 ENABLE_HISTORY_BACKFILL = env_bool("ENABLE_HISTORY_BACKFILL", "false")
 BACKFILL_LIMIT = int(os.getenv("BACKFILL_LIMIT", "10000"))
-
-# Optional export file
-SIGNAL_XLSX_FILE = os.getenv(
-    "SIGNAL_XLSX_FILE", "/data/intellectia_signal_history.xlsx"
-).strip()
-
-APP_VERSION = "raw-json-access-v1"
 
 SYMBOL_RE = re.compile(r"\bSymbol\s+([A-Z]{1,10})\b", re.IGNORECASE)
 
@@ -166,6 +158,29 @@ def get_window_size(now_time: dtime) -> float:
         return WINDOW_SIZES["14:00"]
 
 
+def get_current_window_key(now_time: dtime) -> str:
+    if dtime(9, 30) <= now_time < dtime(10, 0):
+        return "09:30"
+    elif dtime(10, 0) <= now_time < dtime(10, 30):
+        return "10:00"
+    elif dtime(10, 30) <= now_time < dtime(11, 0):
+        return "10:30"
+    elif dtime(11, 0) <= now_time < dtime(11, 30):
+        return "11:00"
+    elif dtime(11, 30) <= now_time < dtime(12, 0):
+        return "11:30"
+    elif dtime(12, 0) <= now_time < dtime(12, 30):
+        return "12:00"
+    elif dtime(12, 30) <= now_time < dtime(13, 0):
+        return "12:30"
+    elif dtime(13, 0) <= now_time < dtime(13, 30):
+        return "13:00"
+    elif dtime(13, 30) <= now_time < dtime(14, 0):
+        return "13:30"
+    else:
+        return "14:00"
+
+
 def get_position_size() -> float:
     now = datetime.now(BUY_WINDOW_TZ)
     weekday = now.weekday()
@@ -195,6 +210,7 @@ today_date_mt = None
 signal_count_by_symbol = {}
 buy_count_today = 0
 open_positions = set()
+window_buy_count = {}
 
 disqualified_symbols = set()
 
@@ -228,32 +244,6 @@ def append_jsonl(path: str, row: dict) -> None:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
     except Exception as e:
         print(f"[LOG][ERROR] Could not append to {path}: {e}")
-
-
-def list_signal_files() -> list[str]:
-    if not os.path.isdir(SIGNAL_LOG_DIR):
-        return []
-    files = []
-    for name in sorted(os.listdir(SIGNAL_LOG_DIR)):
-        if name.endswith(".jsonl"):
-            files.append(name)
-    return files
-
-
-def read_jsonl_file(path: str) -> list[dict]:
-    rows = []
-    if not os.path.exists(path):
-        return rows
-    with open(path, "r", encoding="utf-8") as f:
-        for line_num, line in enumerate(f, start=1):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rows.append(json.loads(line))
-            except Exception as e:
-                print(f"[READ_JSONL][WARN] bad JSON {path} line {line_num}: {e}")
-    return rows
 
 
 # ============================================================
@@ -332,7 +322,7 @@ def buy_window_open_now() -> bool:
 
 
 def reset_if_new_day() -> None:
-    global today_date_mt, signal_count_by_symbol, buy_count_today, disqualified_symbols
+    global today_date_mt, signal_count_by_symbol, buy_count_today, disqualified_symbols, window_buy_count
 
     d = datetime.now(MT).date()
     with lock:
@@ -341,10 +331,12 @@ def reset_if_new_day() -> None:
             signal_count_by_symbol = {}
             buy_count_today = 0
             disqualified_symbols = set()
+            window_buy_count = {}
 
             print("=================================")
             print(f"[RESET] New trading day ({TZ_NAME}): {today_date_mt}")
             print(f"[BUY COUNT] {buy_count_today}/{MAX_BUYS_PER_DAY}")
+            print(f"[WINDOW BUY LIMIT] {MAX_BUYS_PER_WINDOW}")
             print(
                 f"[BUY WINDOW] enabled={BUY_WINDOW_ENABLED} "
                 f"tz={BUY_WINDOW_TZ.key} {BUY_WINDOW_START}->{BUY_WINDOW_END}"
@@ -367,7 +359,6 @@ def reset_if_new_day() -> None:
             print(f"[SIGNAL_LOG_DIR] {SIGNAL_LOG_DIR}")
             print(f"[ENABLE_HISTORY_BACKFILL] {ENABLE_HISTORY_BACKFILL}")
             print(f"[BACKFILL_LIMIT] {BACKFILL_LIMIT}")
-            print(f"[APP_VERSION] {APP_VERSION}")
             if BLACKLIST:
                 print(f"[BLACKLIST] {sorted(BLACKLIST)}")
             print("=================================")
@@ -448,6 +439,7 @@ def decide_action(symbol: str) -> Tuple[Optional[str], Optional[str]]:
 
         next_count = current + 1
 
+        # BUY attempt on odd counts
         if next_count % 2 == 1:
             if buy_count_today >= MAX_BUYS_PER_DAY:
                 return None, "max_buys_reached"
@@ -455,14 +447,24 @@ def decide_action(symbol: str) -> Tuple[Optional[str], Optional[str]]:
             if not buy_window_open_now():
                 return None, "outside_buy_window"
 
+            now_time = datetime.now(BUY_WINDOW_TZ).time()
+            window_key = get_current_window_key(now_time)
+            current_window_count = window_buy_count.get(window_key, 0)
+
+            if current_window_count >= MAX_BUYS_PER_WINDOW:
+                return None, f"max_buys_reached_window_{window_key}"
+
             signal_count_by_symbol[symbol] = next_count
             buy_count_today += 1
+            window_buy_count[window_key] = current_window_count + 1
             open_positions.add(symbol)
             _save_state(open_positions)
 
             print(f"[BUY COUNT] {buy_count_today}/{MAX_BUYS_PER_DAY}")
+            print(f"[WINDOW COUNT] {window_key} {window_buy_count[window_key]}/{MAX_BUYS_PER_WINDOW}")
             return "buy", None
 
+        # SELL attempt on even counts
         if symbol not in open_positions:
             return None, "no_open_position"
 
@@ -511,8 +513,10 @@ app = FastAPI()
 def health():
     reset_if_new_day()
     return {
-        "app_version": APP_VERSION,
         "buy_count_today": buy_count_today,
+        "max_buys_per_day": MAX_BUYS_PER_DAY,
+        "max_buys_per_window": MAX_BUYS_PER_WINDOW,
+        "window_buy_count": window_buy_count,
         "open_positions": list(open_positions),
         "timeframe_sizing_enabled": ENABLE_TIMEFRAME_SIZING,
         "day_multiplier_enabled": ENABLE_DAY_MULTIPLIER,
@@ -529,7 +533,6 @@ def health():
         "history_backfill_enabled": ENABLE_HISTORY_BACKFILL,
         "backfill_limit": BACKFILL_LIMIT,
         "today_log_file": today_signal_log_path() if ENABLE_SIGNAL_LOGGING else None,
-        "available_signal_files": list_signal_files(),
     }
 
 
@@ -541,9 +544,19 @@ def flatten_now():
 
 @app.get("/signals-days")
 def signals_days():
+    if not os.path.isdir(SIGNAL_LOG_DIR):
+        return {
+            "signal_log_dir": SIGNAL_LOG_DIR,
+            "files": [],
+        }
+
+    files = sorted(
+        [name for name in os.listdir(SIGNAL_LOG_DIR) if name.endswith(".jsonl")]
+    )
+
     return {
         "signal_log_dir": SIGNAL_LOG_DIR,
-        "files": list_signal_files(),
+        "files": files,
     }
 
 
@@ -556,56 +569,19 @@ def get_signals_for_day(day: str):
     if not os.path.exists(path):
         raise HTTPException(status_code=404, detail="File not found")
 
-    rows = read_jsonl_file(path)
-    return JSONResponse(
-        content={
-            "day": day,
-            "count": len(rows),
-            "file": path,
-            "rows": rows,
-        }
-    )
+    rows = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
 
-
-@app.get("/download-jsonl/{day}")
-def download_jsonl(day: str):
-    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
-        raise HTTPException(status_code=400, detail="Use day format YYYY-MM-DD")
-
-    path = os.path.join(SIGNAL_LOG_DIR, f"{day}.jsonl")
-    if not os.path.exists(path):
-        raise HTTPException(status_code=404, detail="File not found")
-
-    return FileResponse(
-        path,
-        media_type="application/x-ndjson",
-        filename=f"{day}.jsonl",
-    )
-
-
-@app.get("/download-all-signals-json")
-def download_all_signals_json():
-    files = list_signal_files()
-    if not files:
-        raise HTTPException(status_code=404, detail="No signal files found")
-
-    all_rows = []
-    for name in files:
-        path = os.path.join(SIGNAL_LOG_DIR, name)
-        rows = read_jsonl_file(path)
-        for row in rows:
-            row["_source_file"] = name
-        all_rows.extend(rows)
-
-    out_path = "/tmp/all_signals.json"
-    with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(all_rows, f, ensure_ascii=False)
-
-    return FileResponse(
-        out_path,
-        media_type="application/json",
-        filename="all_signals.json",
-    )
+    return {
+        "day": day,
+        "count": len(rows),
+        "file": path,
+        "rows": rows,
+    }
 
 
 # ============================================================
@@ -758,6 +734,7 @@ async def telethon_main():
                     "decision": action,
                     "reason": reason,
                     "buy_count_today": buy_count_today,
+                    "window_buy_count": window_buy_count,
                     "open_positions": sorted(list(open_positions)),
                     "webhook_payload": webhook_payload,
                     "webhook_status": webhook_status,
