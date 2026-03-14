@@ -477,6 +477,11 @@ def flatten_all_open_positions() -> None:
 app = FastAPI()
 
 
+@app.get("/route-check")
+def route_check():
+    return {"status": "route exists", "time": datetime.now().isoformat()}
+
+
 @app.get("/health")
 def health():
     reset_if_new_day()
