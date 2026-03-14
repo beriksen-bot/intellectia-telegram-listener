@@ -2,11 +2,6 @@ import os
 import json
 import glob
 import pandas as pd
-from pandas.api.types import (
-    is_datetime64_any_dtype,
-    is_datetime64tz_dtype,
-    is_object_dtype,
-)
 
 
 SIGNAL_LOG_DIR = os.getenv("SIGNAL_LOG_DIR", "/data/signals").strip()
@@ -57,43 +52,24 @@ def discover_signal_files() -> list[str]:
     return unique
 
 
-def strip_timezone_from_series(series: pd.Series) -> pd.Series:
-    # Already datetime with timezone
-    if is_datetime64tz_dtype(series):
-        return series.dt.tz_localize(None)
+def maybe_datetime_to_excel_string(series: pd.Series) -> pd.Series:
+    """
+    Convert any datetime-like column to timezone-free string format so Excel
+    cannot choke on tz-aware values.
+    """
+    parsed = pd.to_datetime(series, errors="coerce", utc=True)
 
-    # Naive datetime already fine
-    if is_datetime64_any_dtype(series):
+    # if nothing parsed, leave column alone
+    if not parsed.notna().any():
         return series
 
-    # For object columns, try parsing if they look datetime-like
-    if is_object_dtype(series):
-        parsed = pd.to_datetime(series, errors="coerce", utc=True)
+    # convert to naive datetime, then to string
+    parsed = parsed.dt.tz_localize(None)
+    out = parsed.dt.strftime("%Y-%m-%d %H:%M:%S")
 
-        # Only convert if at least one real datetime was found
-        if parsed.notna().any():
-            return parsed.dt.tz_localize(None)
-
-    return series
-
-
-def make_excel_safe(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-
-    for col in df.columns:
-        try:
-            df[col] = strip_timezone_from_series(df[col])
-        except Exception as e:
-            print(f"[WARN] Could not normalize column {col}: {e}")
-
-    # Final defensive pass: convert any remaining tz-aware python datetimes to strings
-    for col in df.columns:
-        if is_object_dtype(df[col]):
-            df[col] = df[col].map(
-                lambda x: x.isoformat() if hasattr(x, "tzinfo") and getattr(x, "tzinfo", None) is not None else x
-            )
-
-    return df
+    # preserve blanks where parsing failed
+    out = out.where(parsed.notna(), None)
+    return out
 
 
 def normalize_rows(rows: list[dict]) -> pd.DataFrame:
@@ -101,7 +77,13 @@ def normalize_rows(rows: list[dict]) -> pd.DataFrame:
         return pd.DataFrame()
 
     df = pd.json_normalize(rows)
-    df = make_excel_safe(df)
+
+    # aggressively convert every column that looks datetime-like into strings
+    for col in df.columns:
+        try:
+            df[col] = maybe_datetime_to_excel_string(df[col])
+        except Exception as e:
+            print(f"[WARN] Could not normalize column {col}: {e}")
 
     preferred_cols = [
         "kind",
@@ -138,8 +120,7 @@ def build_summary(df: pd.DataFrame) -> pd.DataFrame:
         "date_min": [df["telegram_ts"].min() if "telegram_ts" in df.columns else None],
         "date_max": [df["telegram_ts"].max() if "telegram_ts" in df.columns else None],
     }
-    out = pd.DataFrame(summary)
-    return make_excel_safe(out)
+    return pd.DataFrame(summary)
 
 
 def main():
