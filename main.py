@@ -1,727 +1,132 @@
 import os
-import re
 import json
-import asyncio
-import threading
-import subprocess
-from datetime import datetime, time as dtime
-from typing import Optional, Tuple
-from zoneinfo import ZoneInfo
-from urllib import request as urlrequest
-from urllib.error import URLError, HTTPError
-
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
-import uvicorn
-
-from telethon import TelegramClient, events
-from telethon.sessions import StringSession
-
-from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.triggers.cron import CronTrigger
+import glob
+import pandas as pd
 
 
-# ============================================================
-# ENV / CONFIG
-# ============================================================
-def env_bool(name: str, default: str = "false") -> bool:
-    return os.getenv(name, default).strip().lower() in ("1", "true", "yes", "y", "on")
-
-
-def parse_hhmm(s: str, fallback: str) -> dtime:
-    raw = (s or "").strip()
-    if ":" not in raw:
-        print(f"[CONFIG][WARN] Invalid time '{raw}', using fallback {fallback}")
-        raw = fallback
-
-    parts = raw.split(":")
-    if len(parts) != 2:
-        print(f"[CONFIG][WARN] Invalid time '{raw}', using fallback {fallback}")
-        raw = fallback
-        parts = raw.split(":")
-
-    hh, mm = parts
-
-    try:
-        return dtime(int(hh), int(mm))
-    except Exception:
-        print(f"[CONFIG][WARN] Invalid time '{raw}', using fallback {fallback}")
-        fh, fm = fallback.split(":")
-        return dtime(int(fh), int(fm))
-
-
-API_ID = int(os.getenv("API_ID", "0") or "0")
-API_HASH = os.getenv("API_HASH", "").strip()
-SESSION_STRING = os.getenv("SESSION_STRING", "").strip()
-
-SOURCE_CHAT = os.getenv("SOURCE_CHAT", "").strip()
-TRADERSPOST_WEBHOOK = os.getenv("TRADERSPOST_WEBHOOK", "").strip()
-
-MAX_BUYS_PER_DAY = int(os.getenv("MAX_BUYS_PER_DAY", "5"))
-
-BUY_WINDOW_ENABLED = env_bool("BUY_WINDOW_ENABLED", "true")
-BUY_WINDOW_TZ = ZoneInfo(os.getenv("BUY_WINDOW_TZ", "America/New_York"))
-BUY_WINDOW_START = os.getenv("BUY_WINDOW_START", "12:00")
-BUY_WINDOW_END = os.getenv("BUY_WINDOW_END", "16:00")
-
-DISQUALIFY_OUTSIDE_WINDOW_FIRST_SIGNAL = env_bool(
-    "DISQUALIFY_OUTSIDE_WINDOW_FIRST_SIGNAL", "false"
-)
-
-BLACKLIST_RAW = os.getenv("BLACKLIST", "")
-BLACKLIST = {s.strip().upper() for s in BLACKLIST_RAW.split(",") if s.strip()}
-
-TZ_NAME = os.getenv("TZ_NAME", "America/Denver")
-MT = ZoneInfo(TZ_NAME)
-
-ENABLE_FLATTEN_FAILSAFE = env_bool("ENABLE_FLATTEN_FAILSAFE", "true")
-FLATTEN_HOUR = int(os.getenv("FLATTEN_HOUR", "13"))
-FLATTEN_MINUTE = int(os.getenv("FLATTEN_MINUTE", "55"))
-
-TP_TICKER_KEY = os.getenv("TP_TICKER_KEY", "ticker")
-TP_ACTION_KEY = os.getenv("TP_ACTION_KEY", "action")
-
-# Position sizing controls
-ENABLE_TIMEFRAME_SIZING = env_bool("ENABLE_TIMEFRAME_SIZING", "true")
-ENABLE_DAY_MULTIPLIER = env_bool("ENABLE_DAY_MULTIPLIER", "true")
-DEFAULT_POSITION_SIZE = float(os.getenv("DEFAULT_POSITION_SIZE", "25"))
-MAX_POSITION_SIZE = float(os.getenv("MAX_POSITION_SIZE", "100"))
-
-# Signal-driven stop loss
-STOP_LOSS_ENABLED = env_bool("STOP_LOSS_ENABLED", "false")
-STOP_LOSS_PERCENT = float(os.getenv("STOP_LOSS_PERCENT", "2"))
-
-# Persistent state
-PERSIST_STATE = env_bool("PERSIST_STATE", "false")
-STATE_FILE = os.getenv("STATE_FILE", "/data/trading_state.json").strip()
-
-# Signal logging / backfill
-ENABLE_SIGNAL_LOGGING = env_bool("ENABLE_SIGNAL_LOGGING", "true")
 SIGNAL_LOG_DIR = os.getenv("SIGNAL_LOG_DIR", "/data/signals").strip()
-ENABLE_HISTORY_BACKFILL = env_bool("ENABLE_HISTORY_BACKFILL", "false")
-BACKFILL_LIMIT = int(os.getenv("BACKFILL_LIMIT", "10000"))
-
-# Excel export
-SIGNAL_XLSX_FILE = os.getenv("SIGNAL_XLSX_FILE", "/data/intellectia_signal_history.xlsx").strip()
-
-SYMBOL_RE = re.compile(r"\bSymbol\s+([A-Z]{1,10})\b", re.IGNORECASE)
-
-if not (API_ID and API_HASH and SESSION_STRING):
-    raise RuntimeError("Missing API_ID / API_HASH / SESSION_STRING")
-if not SOURCE_CHAT:
-    raise RuntimeError("Missing SOURCE_CHAT")
-if not TRADERSPOST_WEBHOOK:
-    raise RuntimeError("Missing TRADERSPOST_WEBHOOK")
-
-
-# ============================================================
-# POSITION SIZING CONFIG
-# ============================================================
-WINDOW_SIZES = {
-    "09:30": float(os.getenv("WINDOW_0930", "30")),
-    "10:00": float(os.getenv("WINDOW_1000", "28")),
-    "10:30": float(os.getenv("WINDOW_1030", "26")),
-    "11:00": float(os.getenv("WINDOW_1100", "24")),
-    "11:30": float(os.getenv("WINDOW_1130", "22")),
-    "12:00": float(os.getenv("WINDOW_1200", "20")),
-    "12:30": float(os.getenv("WINDOW_1230", "18")),
-    "13:00": float(os.getenv("WINDOW_1300", "16")),
-    "13:30": float(os.getenv("WINDOW_1330", "14")),
-    "14:00": float(os.getenv("WINDOW_1400", "12")),
-}
-
-DAY_MULTIPLIERS = {
-    0: float(os.getenv("DAY_MON", "1.0")),
-    1: float(os.getenv("DAY_TUE", "1.0")),
-    2: float(os.getenv("DAY_WED", "1.0")),
-    3: float(os.getenv("DAY_THU", "1.0")),
-    4: float(os.getenv("DAY_FRI", "1.0")),
-}
-
-
-def get_window_size(now_time: dtime) -> float:
-    if dtime(9, 30) <= now_time < dtime(10, 0):
-        return WINDOW_SIZES["09:30"]
-    elif dtime(10, 0) <= now_time < dtime(10, 30):
-        return WINDOW_SIZES["10:00"]
-    elif dtime(10, 30) <= now_time < dtime(11, 0):
-        return WINDOW_SIZES["10:30"]
-    elif dtime(11, 0) <= now_time < dtime(11, 30):
-        return WINDOW_SIZES["11:00"]
-    elif dtime(11, 30) <= now_time < dtime(12, 0):
-        return WINDOW_SIZES["11:30"]
-    elif dtime(12, 0) <= now_time < dtime(12, 30):
-        return WINDOW_SIZES["12:00"]
-    elif dtime(12, 30) <= now_time < dtime(13, 0):
-        return WINDOW_SIZES["12:30"]
-    elif dtime(13, 0) <= now_time < dtime(13, 30):
-        return WINDOW_SIZES["13:00"]
-    elif dtime(13, 30) <= now_time < dtime(14, 0):
-        return WINDOW_SIZES["13:30"]
-    else:
-        return WINDOW_SIZES["14:00"]
-
-
-def get_position_size() -> float:
-    now = datetime.now(BUY_WINDOW_TZ)
-    weekday = now.weekday()
-    now_time = now.time()
-
-    if not ENABLE_TIMEFRAME_SIZING and not ENABLE_DAY_MULTIPLIER:
-        return min(DEFAULT_POSITION_SIZE, MAX_POSITION_SIZE)
-
-    base_size = DEFAULT_POSITION_SIZE
-    if ENABLE_TIMEFRAME_SIZING:
-        base_size = get_window_size(now_time)
-
-    multiplier = 1.0
-    if ENABLE_DAY_MULTIPLIER:
-        multiplier = DAY_MULTIPLIERS.get(weekday, 1.0)
-
-    size = round(base_size * multiplier, 2)
-    return min(size, MAX_POSITION_SIZE)
-
-
-# ============================================================
-# STATE
-# ============================================================
-lock = threading.Lock()
-
-today_date_mt = None
-signal_count_by_symbol = {}
-buy_count_today = 0
-open_positions = set()
-
-disqualified_symbols = set()
-
-last_event = None
-last_error = None
-connected = False
-resolved_source = None
-
-
-# ============================================================
-# FILE HELPERS
-# ============================================================
-def _ensure_parent_dir(path: str) -> None:
-    folder = os.path.dirname(path) or "."
-    os.makedirs(folder, exist_ok=True)
-
-
-def signal_log_path_for_date(dt: datetime) -> str:
-    day_str = dt.astimezone(MT).date().isoformat()
-    return os.path.join(SIGNAL_LOG_DIR, f"{day_str}.jsonl")
-
-
-def today_signal_log_path() -> str:
-    return signal_log_path_for_date(datetime.now(MT))
-
-
-def append_jsonl(path: str, row: dict) -> None:
-    try:
-        _ensure_parent_dir(path)
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
-    except Exception as e:
-        print(f"[LOG][ERROR] Could not append to {path}: {e}")
-
-
-# ============================================================
-# PERSISTENCE
-# ============================================================
-def _load_state() -> dict:
-    if not PERSIST_STATE:
-        return {"open_positions": []}
-
-    try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            return data if isinstance(data, dict) else {"open_positions": []}
-    except FileNotFoundError:
-        return {"open_positions": []}
-    except Exception as e:
-        print(f"[STATE][ERROR] load failed: {e}")
-        return {"open_positions": []}
-
-
-def _save_state(open_positions_set: set) -> None:
-    if not PERSIST_STATE:
-        return
-
-    try:
-        folder = os.path.dirname(STATE_FILE) or "."
-        os.makedirs(folder, exist_ok=True)
-
-        tmp = STATE_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump({"open_positions": sorted(list(open_positions_set))}, f)
-        os.replace(tmp, STATE_FILE)
-
-        print(
-            f"[STATE] Saved open_positions ({len(open_positions_set)}): "
-            f"{sorted(list(open_positions_set))}"
-        )
-    except Exception as e:
-        print(f"[STATE][ERROR] save failed: {e}")
-
-
-def _sync_open_positions_from_disk() -> None:
-    global open_positions
-    st = _load_state()
-    raw = st.get("open_positions", [])
-    if not isinstance(raw, list):
-        raw = []
-    open_positions = {str(s).upper() for s in raw if str(s).strip()}
-    print(
-        f"[STATE] Loaded open_positions from disk ({len(open_positions)}): "
-        f"{sorted(list(open_positions))}"
-    )
-
-
-# ============================================================
-# HELPERS
-# ============================================================
-BUY_START_T = parse_hhmm(BUY_WINDOW_START, "12:00")
-BUY_END_T = parse_hhmm(BUY_WINDOW_END, "16:00")
-
-
-def in_time_window(now_t: dtime, start_t: dtime, end_t: dtime) -> bool:
-    if start_t == end_t:
-        return True
-    if start_t < end_t:
-        return start_t <= now_t < end_t
-    return now_t >= start_t or now_t < end_t
-
-
-def buy_window_open_now() -> bool:
-    if not BUY_WINDOW_ENABLED:
-        return True
-    now = datetime.now(BUY_WINDOW_TZ)
-    now_t = now.time().replace(second=0, microsecond=0)
-    return in_time_window(now_t, BUY_START_T, BUY_END_T)
-
-
-def reset_if_new_day() -> None:
-    global today_date_mt, signal_count_by_symbol, buy_count_today, disqualified_symbols
-
-    d = datetime.now(MT).date()
-    with lock:
-        if today_date_mt != d:
-            today_date_mt = d
-            signal_count_by_symbol = {}
-            buy_count_today = 0
-            disqualified_symbols = set()
-
-            print("=================================")
-            print(f"[RESET] New trading day ({TZ_NAME}): {today_date_mt}")
-            print(f"[BUY COUNT] {buy_count_today}/{MAX_BUYS_PER_DAY}")
-            print(
-                f"[BUY WINDOW] enabled={BUY_WINDOW_ENABLED} "
-                f"tz={BUY_WINDOW_TZ.key} {BUY_WINDOW_START}->{BUY_WINDOW_END}"
-            )
-            print(
-                f"[DISQUALIFY_OUTSIDE_WINDOW_FIRST_SIGNAL] "
-                f"{DISQUALIFY_OUTSIDE_WINDOW_FIRST_SIGNAL}"
-            )
-            print(f"[ENABLE_TIMEFRAME_SIZING] {ENABLE_TIMEFRAME_SIZING}")
-            print(f"[ENABLE_DAY_MULTIPLIER] {ENABLE_DAY_MULTIPLIER}")
-            print(f"[DEFAULT_POSITION_SIZE] {DEFAULT_POSITION_SIZE}")
-            print(f"[MAX_POSITION_SIZE] {MAX_POSITION_SIZE}")
-            print(f"[STOP_LOSS_ENABLED] {STOP_LOSS_ENABLED}")
-            print(f"[STOP_LOSS_PERCENT] {STOP_LOSS_PERCENT}")
-            print(
-                f"[FAILSAFE CONFIG] enabled={ENABLE_FLATTEN_FAILSAFE} "
-                f"timezone={TZ_NAME} flatten={FLATTEN_HOUR:02d}:{FLATTEN_MINUTE:02d}"
-            )
-            print(f"[ENABLE_SIGNAL_LOGGING] {ENABLE_SIGNAL_LOGGING}")
-            print(f"[SIGNAL_LOG_DIR] {SIGNAL_LOG_DIR}")
-            print(f"[ENABLE_HISTORY_BACKFILL] {ENABLE_HISTORY_BACKFILL}")
-            print(f"[BACKFILL_LIMIT] {BACKFILL_LIMIT}")
-            print(f"[SIGNAL_XLSX_FILE] {SIGNAL_XLSX_FILE}")
-            if BLACKLIST:
-                print(f"[BLACKLIST] {sorted(BLACKLIST)}")
-            print("=================================")
-
-
-def parse_symbol(text: str) -> Optional[str]:
-    m = SYMBOL_RE.search(text or "")
-    return m.group(1).upper() if m else None
-
-
-# ============================================================
-# WEBHOOK
-# ============================================================
-def post_to_traderspost(symbol: str, action: str) -> Tuple[Optional[int], str, dict]:
-    payload = {
-        TP_TICKER_KEY: symbol,
-        TP_ACTION_KEY: action,
-    }
-
-    if action == "buy":
-        size = get_position_size()
-        payload["quantity"] = size
-        payload["quantityType"] = "percent_of_equity"
-        print(f"[POSITION SIZE] {size}% of equity")
-
-        if STOP_LOSS_ENABLED:
-            payload["stopLoss"] = {
-                "type": "stop",
-                "percent": STOP_LOSS_PERCENT,
-            }
-            print(f"[STOP LOSS] {STOP_LOSS_PERCENT}%")
-
-    print(f"[WEBHOOK PAYLOAD] {payload}")
-
-    data = json.dumps(payload).encode("utf-8")
-    req = urlrequest.Request(
-        TRADERSPOST_WEBHOOK,
-        data=data,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-
-    try:
-        with urlrequest.urlopen(req, timeout=20) as resp:
-            body = resp.read().decode("utf-8", errors="ignore")
-            print(f"[TRADERSPOST] {action.upper()} {symbol} -> {resp.status} {body[:250]}")
-            return resp.status, body, payload
-    except HTTPError as e:
-        body = e.read().decode("utf-8", errors="ignore") if hasattr(e, "read") else str(e)
-        print(f"[TRADERSPOST][HTTPError] {action.upper()} {symbol} -> {e.code} {body[:250]}")
-        return e.code, body, payload
-    except URLError as e:
-        msg = str(e)
-        print(f"[TRADERSPOST][URLError] {action.upper()} {symbol} -> {msg}")
-        return None, msg, payload
-
-
-# ============================================================
-# SIGNAL LOGIC
-# ============================================================
-def decide_action(symbol: str) -> Tuple[Optional[str], Optional[str]]:
-    global buy_count_today
-
-    reset_if_new_day()
-
-    if symbol in BLACKLIST:
-        return None, "blacklisted"
-
-    with lock:
-        if DISQUALIFY_OUTSIDE_WINDOW_FIRST_SIGNAL and symbol in disqualified_symbols:
-            return None, "disqualified_for_day"
-
-        current = signal_count_by_symbol.get(symbol, 0)
-
-        if DISQUALIFY_OUTSIDE_WINDOW_FIRST_SIGNAL and current == 0 and not buy_window_open_now():
-            disqualified_symbols.add(symbol)
-            return None, "first_signal_outside_buy_window"
-
-        next_count = current + 1
-
-        if next_count % 2 == 1:
-            if buy_count_today >= MAX_BUYS_PER_DAY:
-                return None, "max_buys_reached"
-
-            if not buy_window_open_now():
-                return None, "outside_buy_window"
-
-            signal_count_by_symbol[symbol] = next_count
-            buy_count_today += 1
-            open_positions.add(symbol)
-            _save_state(open_positions)
-
-            print(f"[BUY COUNT] {buy_count_today}/{MAX_BUYS_PER_DAY}")
-            return "buy", None
-
-        if symbol not in open_positions:
-            return None, "no_open_position"
-
-        signal_count_by_symbol[symbol] = next_count
-        open_positions.discard(symbol)
-        _save_state(open_positions)
-
-        print(f"[BUY COUNT] still {buy_count_today}/{MAX_BUYS_PER_DAY}")
-        return "sell", None
-
-
-# ============================================================
-# FAILSAFE
-# ============================================================
-def flatten_all_open_positions() -> None:
-    reset_if_new_day()
-
-    with lock:
-        symbols = sorted(open_positions)
-
-    print(f"[FAILSAFE] Trigger @ {datetime.now(MT).isoformat()} open_positions={symbols}")
-
-    if not symbols:
-        print("[FAILSAFE] nothing open")
-        return
-
-    print(f"[FAILSAFE] closing {symbols}")
-
-    for sym in symbols:
-        post_to_traderspost(sym, "sell")
-
-    with lock:
-        open_positions.clear()
-    _save_state(open_positions)
-
-    print("[FAILSAFE] Flatten complete; state cleared and saved.")
-
-
-# ============================================================
-# FASTAPI
-# ============================================================
-app = FastAPI()
-
-
-@app.get("/route-check")
-def route_check():
-    return {"status": "route exists", "time": datetime.now().isoformat()}
-
-
-@app.get("/health")
-def health():
-    reset_if_new_day()
-    return {
-        "buy_count_today": buy_count_today,
-        "open_positions": list(open_positions),
-        "timeframe_sizing_enabled": ENABLE_TIMEFRAME_SIZING,
-        "day_multiplier_enabled": ENABLE_DAY_MULTIPLIER,
-        "default_position_size": DEFAULT_POSITION_SIZE,
-        "max_position_size": MAX_POSITION_SIZE,
-        "stop_loss_enabled": STOP_LOSS_ENABLED,
-        "stop_loss_percent": STOP_LOSS_PERCENT,
-        "failsafe_enabled": ENABLE_FLATTEN_FAILSAFE,
-        "failsafe_timezone": TZ_NAME,
-        "failsafe_hour": FLATTEN_HOUR,
-        "failsafe_minute": FLATTEN_MINUTE,
-        "signal_logging_enabled": ENABLE_SIGNAL_LOGGING,
-        "signal_log_dir": SIGNAL_LOG_DIR,
-        "history_backfill_enabled": ENABLE_HISTORY_BACKFILL,
-        "backfill_limit": BACKFILL_LIMIT,
-        "today_log_file": today_signal_log_path() if ENABLE_SIGNAL_LOGGING else None,
-        "signal_xlsx_file": SIGNAL_XLSX_FILE,
-    }
-
-
-@app.post("/flatten-now")
-def flatten_now():
-    flatten_all_open_positions()
-    return {"ok": True}
-
-
-@app.get("/download-signals")
-def download_signals():
-    try:
-        result = subprocess.run(
-            ["python", "export_signals_to_excel.py"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        print(f"[EXPORT] stdout: {result.stdout.strip()}")
-        if result.stderr.strip():
-            print(f"[EXPORT] stderr: {result.stderr.strip()}")
-
-        if result.returncode != 0:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Excel export failed with code {result.returncode}"
-            )
-
-        if not os.path.exists(SIGNAL_XLSX_FILE):
-            raise HTTPException(
-                status_code=404,
-                detail=f"Excel file not found: {SIGNAL_XLSX_FILE}"
-            )
-
-        return FileResponse(
-            SIGNAL_XLSX_FILE,
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            filename="intellectia_signal_history.xlsx",
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# ============================================================
-# SCHEDULER
-# ============================================================
-scheduler = BackgroundScheduler(timezone=MT)
-
-if ENABLE_FLATTEN_FAILSAFE:
-    scheduler.add_job(
-        flatten_all_open_positions,
-        CronTrigger(day_of_week="mon-fri", hour=FLATTEN_HOUR, minute=FLATTEN_MINUTE),
-        id="flatten_failsafe",
-        replace_existing=True,
-    )
-
-print(
-    f"[FAILSAFE CONFIG] enabled={ENABLE_FLATTEN_FAILSAFE} "
-    f"timezone={TZ_NAME} flatten={FLATTEN_HOUR:02d}:{FLATTEN_MINUTE:02d}"
-)
-
-scheduler.start()
-
-
-# ============================================================
-# TELEGRAM LISTENER
-# ============================================================
-client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
-
-
-async def maybe_backfill_history(entity) -> None:
-    if not ENABLE_SIGNAL_LOGGING or not ENABLE_HISTORY_BACKFILL:
-        return
-
-    print(f"[BACKFILL] Starting history backfill (limit={BACKFILL_LIMIT})")
-
-    count = 0
-    async for msg in client.iter_messages(entity, limit=BACKFILL_LIMIT):
-        try:
-            if getattr(msg, "out", False):
+SIGNAL_XLSX_FILE = os.getenv(
+    "SIGNAL_XLSX_FILE", "/data/intellectia_signal_history.xlsx"
+).strip()
+
+# Fallback legacy/single-file paths
+FALLBACK_FILES = [
+    "/data/intellectia_signal_log.jsonl",
+    "/data/signals.jsonl",
+]
+
+
+def load_jsonl_file(path: str) -> list[dict]:
+    rows = []
+    if not os.path.exists(path):
+        return rows
+
+    with open(path, "r", encoding="utf-8") as f:
+        for line_num, line in enumerate(f, start=1):
+            line = line.strip()
+            if not line:
                 continue
-
-            text = (getattr(msg, "raw_text", "") or "").strip()
-            if not text:
-                continue
-
-            msg_dt = msg.date
-            symbol = parse_symbol(text)
-
-            row = {
-                "kind": "history_message",
-                "message_id": msg.id,
-                "telegram_ts": msg_dt.isoformat() if msg_dt else None,
-                "logged_ts": datetime.now(MT).isoformat(),
-                "source_chat": SOURCE_CHAT,
-                "incoming": True,
-                "outgoing": False,
-                "symbol": symbol,
-                "raw_text": text,
-            }
-
-            if msg_dt is not None:
-                path = signal_log_path_for_date(msg_dt)
-                append_jsonl(path, row)
-                count += 1
-        except Exception as e:
-            print(f"[BACKFILL][ERROR] {e}")
-
-    print(f"[BACKFILL] Completed. Logged {count} received messages.")
+            try:
+                rows.append(json.loads(line))
+            except Exception as e:
+                print(f"[WARN] Skipping bad JSON in {path} line {line_num}: {e}")
+    return rows
 
 
-async def telethon_main():
-    global connected, resolved_source, last_error, last_event
+def discover_signal_files() -> list[str]:
+    files = []
 
-    print("[BOOT] starting listener")
+    if os.path.isdir(SIGNAL_LOG_DIR):
+        files.extend(sorted(glob.glob(os.path.join(SIGNAL_LOG_DIR, "*.jsonl"))))
 
-    await client.start()
-    me = await client.get_me()
-    connected = True
+    for fallback in FALLBACK_FILES:
+        if os.path.exists(fallback):
+            files.append(fallback)
 
-    print(f"[BOOT] Logged in as: {getattr(me, 'first_name', '')} (id={me.id})")
-    print(f"[BOOT] Listening for messages from: {SOURCE_CHAT}")
+    # de-dupe while preserving order
+    seen = set()
+    unique = []
+    for f in files:
+        if f not in seen:
+            seen.add(f)
+            unique.append(f)
 
-    _sync_open_positions_from_disk()
-
-    try:
-        entity = await client.get_entity(SOURCE_CHAT)
-        resolved_source = (
-            f"id={getattr(entity, 'id', None)} "
-            f"name={getattr(entity, 'title', None) or getattr(entity, 'username', None) or SOURCE_CHAT}"
-        )
-        print(f"[RESOLVE] SOURCE_CHAT resolved: {resolved_source}")
-    except Exception as e:
-        last_error = f"resolve_failed: {e}"
-        print(f"[ERROR] Could not resolve SOURCE_CHAT={SOURCE_CHAT}: {e}")
-        raise
-
-    await maybe_backfill_history(entity)
-
-    @client.on(events.NewMessage(chats=entity))
-    async def on_message(event):
-        global last_event, last_error
-
-        try:
-            if getattr(event, "out", False) or getattr(event.message, "out", False):
-                print("[LOG] Skipping outgoing/self-sent message")
-                return
-
-            reset_if_new_day()
-
-            text = (event.raw_text or "").strip()
-            if not text:
-                return
-
-            last_event = text[:300]
-            print(f"[RX] {text}")
-
-            symbol = parse_symbol(text)
-            action, reason = (None, "no_symbol") if not symbol else decide_action(symbol)
-
-            webhook_status = None
-            webhook_body = None
-            webhook_payload = None
-
-            if symbol and action is not None:
-                print(f"[SIGNAL] {symbol} -> {action.upper()}")
-                webhook_status, webhook_body, webhook_payload = post_to_traderspost(symbol, action)
-            elif symbol:
-                if reason in ("outside_buy_window", "first_signal_outside_buy_window"):
-                    now_et = datetime.now(BUY_WINDOW_TZ).strftime("%H:%M")
-                    print(
-                        f"[WINDOW] Outside buy window "
-                        f"({BUY_WINDOW_START}-{BUY_WINDOW_END} {BUY_WINDOW_TZ.key}). "
-                        f"Now={now_et}. BLOCK {symbol} ({reason})"
-                    )
-                else:
-                    print(f"[BLOCKED] {symbol} reason={reason}")
-
-            if ENABLE_SIGNAL_LOGGING:
-                path = today_signal_log_path()
-                row = {
-                    "kind": "live_message",
-                    "message_id": getattr(event.message, "id", None),
-                    "telegram_ts": event.message.date.isoformat() if getattr(event.message, "date", None) else None,
-                    "logged_ts": datetime.now(MT).isoformat(),
-                    "source_chat": SOURCE_CHAT,
-                    "incoming": True,
-                    "outgoing": False,
-                    "symbol": symbol,
-                    "raw_text": text,
-                    "decision": action,
-                    "reason": reason,
-                    "buy_count_today": buy_count_today,
-                    "open_positions": sorted(list(open_positions)),
-                    "webhook_payload": webhook_payload,
-                    "webhook_status": webhook_status,
-                    "webhook_body": webhook_body[:500] if isinstance(webhook_body, str) else webhook_body,
-                }
-                append_jsonl(path, row)
-                print(f"[LOG] Appended signal row -> {path}")
-
-        except Exception as e:
-            last_error = str(e)
-            print(f"[ERROR] handler: {e}")
-
-    await client.run_until_disconnected()
+    return unique
 
 
-@app.on_event("startup")
-async def startup():
-    asyncio.create_task(telethon_main())
+def normalize_rows(rows: list[dict]) -> pd.DataFrame:
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.json_normalize(rows)
+
+    preferred_cols = [
+        "kind",
+        "message_id",
+        "telegram_ts",
+        "logged_ts",
+        "source_chat",
+        "incoming",
+        "outgoing",
+        "symbol",
+        "decision",
+        "reason",
+        "buy_count_today",
+        "raw_text",
+        "webhook_status",
+        "webhook_body",
+    ]
+
+    existing_preferred = [c for c in preferred_cols if c in df.columns]
+    remaining = [c for c in df.columns if c not in existing_preferred]
+    df = df[existing_preferred + remaining]
+
+    for dt_col in ["telegram_ts", "logged_ts"]:
+        if dt_col in df.columns:
+            df[dt_col] = pd.to_datetime(df[dt_col], errors="coerce")
+
+    sort_cols = [c for c in ["telegram_ts", "logged_ts", "message_id"] if c in df.columns]
+    if sort_cols:
+        df = df.sort_values(sort_cols, kind="stable")
+
+    return df
 
 
-# ============================================================
-# ENTRYPOINT
-# ============================================================
+def main():
+    files = discover_signal_files()
+
+    print(f"[EXPORT] SIGNAL_LOG_DIR={SIGNAL_LOG_DIR}")
+    print(f"[EXPORT] Found {len(files)} candidate files")
+    for f in files:
+        print(f"[EXPORT] file: {f}")
+
+    all_rows = []
+    for path in files:
+        all_rows.extend(load_jsonl_file(path))
+
+    print(f"[EXPORT] Loaded {len(all_rows)} total rows")
+
+    if not all_rows:
+        raise SystemExit("No signal rows found to export")
+
+    df = normalize_rows(all_rows)
+
+    out_dir = os.path.dirname(SIGNAL_XLSX_FILE) or "."
+    os.makedirs(out_dir, exist_ok=True)
+
+    with pd.ExcelWriter(SIGNAL_XLSX_FILE, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name="signals", index=False)
+
+        summary = {
+            "total_rows": [len(df)],
+            "unique_symbols": [df["symbol"].nunique() if "symbol" in df.columns else 0],
+            "date_min": [df["telegram_ts"].min() if "telegram_ts" in df.columns else None],
+            "date_max": [df["telegram_ts"].max() if "telegram_ts" in df.columns else None],
+        }
+        pd.DataFrame(summary).to_excel(writer, sheet_name="summary", index=False)
+
+    print(f"[EXPORT] Wrote Excel file: {SIGNAL_XLSX_FILE}")
+
+
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "8080"))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    main()
