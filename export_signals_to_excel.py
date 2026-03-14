@@ -1,162 +1,132 @@
 import os
 import json
-from collections import defaultdict
-from datetime import datetime
-from pathlib import Path
-
+import glob
 import pandas as pd
 
 
-SIGNAL_LOG_DIR = os.getenv("SIGNAL_LOG_DIR", "/data/signals")
-OUTPUT_XLSX = os.getenv("SIGNAL_XLSX_FILE", "/data/intellectia_signal_history.xlsx")
+SIGNAL_LOG_DIR = os.getenv("SIGNAL_LOG_DIR", "/data/signals").strip()
+SIGNAL_XLSX_FILE = os.getenv(
+    "SIGNAL_XLSX_FILE", "/data/intellectia_signal_history.xlsx"
+).strip()
+
+# Fallback legacy/single-file paths
+FALLBACK_FILES = [
+    "/data/intellectia_signal_log.jsonl",
+    "/data/signals.jsonl",
+]
 
 
-def read_jsonl_files(signal_dir: str) -> list[dict]:
-    rows: list[dict] = []
-    base = Path(signal_dir)
-
-    if not base.exists():
-        print(f"No signal directory found: {signal_dir}")
+def load_jsonl_file(path: str) -> list[dict]:
+    rows = []
+    if not os.path.exists(path):
         return rows
 
-    for path in sorted(base.glob("*.jsonl")):
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    row = json.loads(line)
-                    row["_source_file"] = path.name
-                    rows.append(row)
-                except Exception as e:
-                    print(f"Skipping bad line in {path.name}: {e}")
-
+    with open(path, "r", encoding="utf-8") as f:
+        for line_num, line in enumerate(f, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except Exception as e:
+                print(f"[WARN] Skipping bad JSON in {path} line {line_num}: {e}")
     return rows
 
 
+def discover_signal_files() -> list[str]:
+    files = []
+
+    if os.path.isdir(SIGNAL_LOG_DIR):
+        files.extend(sorted(glob.glob(os.path.join(SIGNAL_LOG_DIR, "*.jsonl"))))
+
+    for fallback in FALLBACK_FILES:
+        if os.path.exists(fallback):
+            files.append(fallback)
+
+    # de-dupe while preserving order
+    seen = set()
+    unique = []
+    for f in files:
+        if f not in seen:
+            seen.add(f)
+            unique.append(f)
+
+    return unique
+
+
 def normalize_rows(rows: list[dict]) -> pd.DataFrame:
-    normalized = []
+    if not rows:
+        return pd.DataFrame()
 
-    for r in rows:
-        wp = r.get("webhook_payload") or {}
-        normalized.append(
-            {
-                "source_file": r.get("_source_file"),
-                "kind": r.get("kind"),
-                "message_id": r.get("message_id"),
-                "telegram_ts": r.get("telegram_ts"),
-                "logged_ts": r.get("logged_ts"),
-                "source_chat": r.get("source_chat"),
-                "incoming": r.get("incoming"),
-                "outgoing": r.get("outgoing"),
-                "symbol": r.get("symbol"),
-                "raw_text": r.get("raw_text"),
-                "decision": r.get("decision"),
-                "reason": r.get("reason"),
-                "buy_count_today": r.get("buy_count_today"),
-                "open_positions": ", ".join(r.get("open_positions", [])) if isinstance(r.get("open_positions"), list) else r.get("open_positions"),
-                "webhook_action": wp.get("action"),
-                "webhook_ticker": wp.get("ticker"),
-                "webhook_quantity": wp.get("quantity"),
-                "webhook_quantity_type": wp.get("quantityType"),
-                "webhook_status": r.get("webhook_status"),
-                "webhook_body": r.get("webhook_body"),
-            }
-        )
+    df = pd.json_normalize(rows)
 
-    df = pd.DataFrame(normalized)
+    preferred_cols = [
+        "kind",
+        "message_id",
+        "telegram_ts",
+        "logged_ts",
+        "source_chat",
+        "incoming",
+        "outgoing",
+        "symbol",
+        "decision",
+        "reason",
+        "buy_count_today",
+        "raw_text",
+        "webhook_status",
+        "webhook_body",
+    ]
 
-    if not df.empty:
-        df["telegram_ts"] = pd.to_datetime(df["telegram_ts"], errors="coerce")
-        df["logged_ts"] = pd.to_datetime(df["logged_ts"], errors="coerce")
-        df["date"] = df["telegram_ts"].dt.date
-        df["time"] = df["telegram_ts"].dt.time
+    existing_preferred = [c for c in preferred_cols if c in df.columns]
+    remaining = [c for c in df.columns if c not in existing_preferred]
+    df = df[existing_preferred + remaining]
+
+    for dt_col in ["telegram_ts", "logged_ts"]:
+        if dt_col in df.columns:
+            df[dt_col] = pd.to_datetime(df[dt_col], errors="coerce")
+
+    sort_cols = [c for c in ["telegram_ts", "logged_ts", "message_id"] if c in df.columns]
+    if sort_cols:
+        df = df.sort_values(sort_cols, kind="stable")
 
     return df
 
 
-def build_daily_summary(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return pd.DataFrame()
+def main():
+    files = discover_signal_files()
 
-    out = []
-    for day, group in df.groupby("date", dropna=True):
-        out.append(
-            {
-                "date": day,
-                "total_messages": len(group),
-                "symbols_seen": group["symbol"].dropna().nunique(),
-                "buy_signals": (group["decision"] == "buy").sum(),
-                "sell_signals": (group["decision"] == "sell").sum(),
-                "blocked_signals": group["reason"].notna().sum(),
-                "blacklisted": (group["reason"] == "blacklisted").sum(),
-                "outside_window": (group["reason"] == "outside_buy_window").sum(),
-                "first_signal_outside_window": (group["reason"] == "first_signal_outside_buy_window").sum(),
-                "max_buys_reached": (group["reason"] == "max_buys_reached").sum(),
-                "no_open_position": (group["reason"] == "no_open_position").sum(),
-                "disqualified_for_day": (group["reason"] == "disqualified_for_day").sum(),
-            }
-        )
+    print(f"[EXPORT] SIGNAL_LOG_DIR={SIGNAL_LOG_DIR}")
+    print(f"[EXPORT] Found {len(files)} candidate files")
+    for f in files:
+        print(f"[EXPORT] file: {f}")
 
-    return pd.DataFrame(out).sort_values("date")
+    all_rows = []
+    for path in files:
+        all_rows.extend(load_jsonl_file(path))
 
+    print(f"[EXPORT] Loaded {len(all_rows)} total rows")
 
-def build_symbol_summary(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return pd.DataFrame()
+    if not all_rows:
+        raise SystemExit("No signal rows found to export")
 
-    out = []
-    for symbol, group in df.groupby("symbol", dropna=True):
-        out.append(
-            {
-                "symbol": symbol,
-                "total_messages": len(group),
-                "buy_signals": (group["decision"] == "buy").sum(),
-                "sell_signals": (group["decision"] == "sell").sum(),
-                "blocked_signals": group["reason"].notna().sum(),
-                "first_seen": group["telegram_ts"].min(),
-                "last_seen": group["telegram_ts"].max(),
-            }
-        )
+    df = normalize_rows(all_rows)
 
-    return pd.DataFrame(out).sort_values(["total_messages", "symbol"], ascending=[False, True])
+    out_dir = os.path.dirname(SIGNAL_XLSX_FILE) or "."
+    os.makedirs(out_dir, exist_ok=True)
 
+    with pd.ExcelWriter(SIGNAL_XLSX_FILE, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name="signals", index=False)
 
-def export_excel(signal_dir: str, output_xlsx: str) -> None:
-    rows = read_jsonl_files(signal_dir)
-    df = normalize_rows(rows)
-    daily_df = build_daily_summary(df)
-    symbol_df = build_symbol_summary(df)
+        summary = {
+            "total_rows": [len(df)],
+            "unique_symbols": [df["symbol"].nunique() if "symbol" in df.columns else 0],
+            "date_min": [df["telegram_ts"].min() if "telegram_ts" in df.columns else None],
+            "date_max": [df["telegram_ts"].max() if "telegram_ts" in df.columns else None],
+        }
+        pd.DataFrame(summary).to_excel(writer, sheet_name="summary", index=False)
 
-    Path(output_xlsx).parent.mkdir(parents=True, exist_ok=True)
-
-    with pd.ExcelWriter(output_xlsx, engine="openpyxl") as writer:
-        df.to_excel(writer, sheet_name="Signals", index=False)
-        daily_df.to_excel(writer, sheet_name="Daily Summary", index=False)
-        symbol_df.to_excel(writer, sheet_name="Symbol Summary", index=False)
-
-        for sheet_name, frame in {
-            "Signals": df,
-            "Daily Summary": daily_df,
-            "Symbol Summary": symbol_df,
-        }.items():
-            ws = writer.book[sheet_name]
-            ws.freeze_panes = "A2"
-
-            for col_cells in ws.columns:
-                max_len = 0
-                col_letter = col_cells[0].column_letter
-                for cell in col_cells:
-                    try:
-                        val = "" if cell.value is None else str(cell.value)
-                        max_len = max(max_len, len(val))
-                    except Exception:
-                        pass
-                ws.column_dimensions[col_letter].width = min(max(max_len + 2, 12), 40)
-
-    print(f"Excel exported to: {output_xlsx}")
+    print(f"[EXPORT] Wrote Excel file: {SIGNAL_XLSX_FILE}")
 
 
 if __name__ == "__main__":
-    export_excel(SIGNAL_LOG_DIR, OUTPUT_XLSX)
+    main()
