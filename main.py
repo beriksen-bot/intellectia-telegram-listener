@@ -11,7 +11,7 @@ from urllib import request as urlrequest
 from urllib.error import URLError, HTTPError
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 import uvicorn
 
 from telethon import TelegramClient, events
@@ -101,8 +101,12 @@ SIGNAL_LOG_DIR = os.getenv("SIGNAL_LOG_DIR", "/data/signals").strip()
 ENABLE_HISTORY_BACKFILL = env_bool("ENABLE_HISTORY_BACKFILL", "false")
 BACKFILL_LIMIT = int(os.getenv("BACKFILL_LIMIT", "10000"))
 
-# Excel export
-SIGNAL_XLSX_FILE = os.getenv("SIGNAL_XLSX_FILE", "/data/intellectia_signal_history.xlsx").strip()
+# Optional export file
+SIGNAL_XLSX_FILE = os.getenv(
+    "SIGNAL_XLSX_FILE", "/data/intellectia_signal_history.xlsx"
+).strip()
+
+APP_VERSION = "raw-json-access-v1"
 
 SYMBOL_RE = re.compile(r"\bSymbol\s+([A-Z]{1,10})\b", re.IGNORECASE)
 
@@ -226,6 +230,32 @@ def append_jsonl(path: str, row: dict) -> None:
         print(f"[LOG][ERROR] Could not append to {path}: {e}")
 
 
+def list_signal_files() -> list[str]:
+    if not os.path.isdir(SIGNAL_LOG_DIR):
+        return []
+    files = []
+    for name in sorted(os.listdir(SIGNAL_LOG_DIR)):
+        if name.endswith(".jsonl"):
+            files.append(name)
+    return files
+
+
+def read_jsonl_file(path: str) -> list[dict]:
+    rows = []
+    if not os.path.exists(path):
+        return rows
+    with open(path, "r", encoding="utf-8") as f:
+        for line_num, line in enumerate(f, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except Exception as e:
+                print(f"[READ_JSONL][WARN] bad JSON {path} line {line_num}: {e}")
+    return rows
+
+
 # ============================================================
 # PERSISTENCE
 # ============================================================
@@ -337,7 +367,7 @@ def reset_if_new_day() -> None:
             print(f"[SIGNAL_LOG_DIR] {SIGNAL_LOG_DIR}")
             print(f"[ENABLE_HISTORY_BACKFILL] {ENABLE_HISTORY_BACKFILL}")
             print(f"[BACKFILL_LIMIT] {BACKFILL_LIMIT}")
-            print(f"[SIGNAL_XLSX_FILE] {SIGNAL_XLSX_FILE}")
+            print(f"[APP_VERSION] {APP_VERSION}")
             if BLACKLIST:
                 print(f"[BLACKLIST] {sorted(BLACKLIST)}")
             print("=================================")
@@ -477,15 +507,11 @@ def flatten_all_open_positions() -> None:
 app = FastAPI()
 
 
-@app.get("/route-check")
-def route_check():
-    return {"status": "route exists", "time": datetime.now().isoformat()}
-
-
 @app.get("/health")
 def health():
     reset_if_new_day()
     return {
+        "app_version": APP_VERSION,
         "buy_count_today": buy_count_today,
         "open_positions": list(open_positions),
         "timeframe_sizing_enabled": ENABLE_TIMEFRAME_SIZING,
@@ -503,7 +529,7 @@ def health():
         "history_backfill_enabled": ENABLE_HISTORY_BACKFILL,
         "backfill_limit": BACKFILL_LIMIT,
         "today_log_file": today_signal_log_path() if ENABLE_SIGNAL_LOGGING else None,
-        "signal_xlsx_file": SIGNAL_XLSX_FILE,
+        "available_signal_files": list_signal_files(),
     }
 
 
@@ -513,40 +539,73 @@ def flatten_now():
     return {"ok": True}
 
 
-@app.get("/download-signals")
-def download_signals():
-    try:
-        result = subprocess.run(
-            ["python", "export_signals_to_excel.py"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        print(f"[EXPORT] stdout: {result.stdout.strip()}")
-        if result.stderr.strip():
-            print(f"[EXPORT] stderr: {result.stderr.strip()}")
+@app.get("/signals-days")
+def signals_days():
+    return {
+        "signal_log_dir": SIGNAL_LOG_DIR,
+        "files": list_signal_files(),
+    }
 
-        if result.returncode != 0:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Excel export failed with code {result.returncode}"
-            )
 
-        if not os.path.exists(SIGNAL_XLSX_FILE):
-            raise HTTPException(
-                status_code=404,
-                detail=f"Excel file not found: {SIGNAL_XLSX_FILE}"
-            )
+@app.get("/signals/{day}")
+def get_signals_for_day(day: str):
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
+        raise HTTPException(status_code=400, detail="Use day format YYYY-MM-DD")
 
-        return FileResponse(
-            SIGNAL_XLSX_FILE,
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            filename="intellectia_signal_history.xlsx",
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    path = os.path.join(SIGNAL_LOG_DIR, f"{day}.jsonl")
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="File not found")
+
+    rows = read_jsonl_file(path)
+    return JSONResponse(
+        content={
+            "day": day,
+            "count": len(rows),
+            "file": path,
+            "rows": rows,
+        }
+    )
+
+
+@app.get("/download-jsonl/{day}")
+def download_jsonl(day: str):
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
+        raise HTTPException(status_code=400, detail="Use day format YYYY-MM-DD")
+
+    path = os.path.join(SIGNAL_LOG_DIR, f"{day}.jsonl")
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="File not found")
+
+    return FileResponse(
+        path,
+        media_type="application/x-ndjson",
+        filename=f"{day}.jsonl",
+    )
+
+
+@app.get("/download-all-signals-json")
+def download_all_signals_json():
+    files = list_signal_files()
+    if not files:
+        raise HTTPException(status_code=404, detail="No signal files found")
+
+    all_rows = []
+    for name in files:
+        path = os.path.join(SIGNAL_LOG_DIR, name)
+        rows = read_jsonl_file(path)
+        for row in rows:
+            row["_source_file"] = name
+        all_rows.extend(rows)
+
+    out_path = "/tmp/all_signals.json"
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(all_rows, f, ensure_ascii=False)
+
+    return FileResponse(
+        out_path,
+        media_type="application/json",
+        filename="all_signals.json",
+    )
 
 
 # ============================================================
